@@ -31,7 +31,8 @@ response.
   models mid-conversation without losing history. Thinking levels can be changed
   the same way.
 - **Streaming with thought summaries**: summaries come back as `thinking` blocks.
-  Set `AGY_BRIDGE_THINKING=0` to turn them off.
+  On new Magpie builds turn them off on the Providers page; on older hosts set
+  `AGY_BRIDGE_THINKING=0`.
 - **Image input**: inline base64 PNG, JPEG, GIF and WebP. This needs agy 1.5.0 or
   newer, because the ACP server has to advertise image support.
 - **Tool calls**: parallel and consecutive calls both work. A tool that runs past
@@ -46,6 +47,10 @@ response.
   file edits, browser) is refused. Real actions happen on the client side.
 - **Usage visibility**: Magpie shows the agy subscription usage windows. They are
   informational only; running out of quota does not block requests automatically.
+- **Multi-account auto-switching**: when the current agy account runs out of
+  quota, the plugin stops its own agy processes and switches the local CLI to
+  the next captured account. Off by default; enable it on the Providers page.
+  One account at a time — see "Multi-account auto-switching" below.
 
 ## Requirements
 
@@ -83,8 +88,9 @@ After installing, run `agy` once in a terminal to complete the Google sign-in.
 ## Usage
 
 1. Open Magpie's Providers page, find `yce-magpie-agy`, and click Sign in. The
-   plugin uses `agy models` to confirm the CLI works. Google credentials stay with
-   agy; the plugin never reads or stores them.
+   plugin uses `agy models` to confirm the CLI works. Google credentials stay
+   with agy; the plugin does not read or store them unless multi-account
+   auto-switching is enabled (see below).
 2. Refer to models as `yce-magpie-agy/<model>`. When agy lists separate model IDs
    for different thinking levels, they are grouped here as variants of one model,
    and each request is mapped back to the matching agy ID.
@@ -109,6 +115,28 @@ After installing, run `agy` once in a terminal to complete the Google sign-in.
   construction has unit tests; end-to-end runs on real Windows hardware are still
   pending.
 
+### Manual reproduction steps on native Windows (multi-account auto-switching)
+
+These five steps verify auto-switching on a native Windows host. They have **not
+been run yet**; native Windows is not verified end-to-end:
+
+1. Turn on the Auto-switch switch on Magpie's Providers page (token capture only
+   happens while the switch is on), then sign in once from a terminal with each
+   of the two Google accounts by running `agy`; after each sign-in send one
+   request through Magpie so the plugin captures that account's token backup.
+2. Fill the plugin Options with `{"accounts":["A","B"]}` (replace A and B with
+   the two emails; leaving it empty falls back to active+old discovery) and
+   restart the host.
+3. Exhaust a model group's quota on account A (or wait for a real exhaustion):
+   the request still answers HTTP 429, afterwards
+   `%USERPROFILE%\.gemini\google_accounts.json` shows `active` = B, and
+   `magpie quota yce-magpie-agy --json` prefixes its window names with B's
+   masked address.
+4. Keep an `agy` running in another terminal and trigger a switch: the plugin
+   must not switch, and quota's error field reports "in flight".
+5. Run `agy --version` once inside WSL: the launcher wrapper synchronizes the
+   WSL side to account B.
+
 ## Usage quota
 
 ```sh
@@ -117,8 +145,11 @@ magpie quota refresh yce-magpie-agy --json
 ```
 
 The numbers come from agy's own `/usage` report for whichever account is signed
-in to the CLI, broken down by model group. The plugin does not read or write
-Google tokens and does not present itself as another account. A window with no
+in to the CLI, broken down by model group. With auto-switching off the plugin
+neither reads nor writes Google tokens and never presents itself as another
+account; with auto-switching on it reads the token file to back it up and to
+show the current account's mask in the quota view (see "Multi-account
+auto-switching"). A window with no
 measurable data shows "Limits not available" rather than a fake 0% or 100%.
 
 ## Environment variables
@@ -127,9 +158,8 @@ measurable data shows "Limits not available" rather than a fake 0% or 100%.
 |---|---|---|
 | `AGY_PATH` | PATH lookup | Path to the agy executable |
 | `AGY_BRIDGE_MAX_PROCS` | 16 | Maximum number of agy processes in the pool |
-| `AGY_BRIDGE_THINKING` | on | Set to `0` to stop forwarding thought summaries |
-| `AGY_BRIDGE_EFFORT` | unset | Force a thinking level: `minimal`, `low`, `medium`, `high`, `xhigh` or `max` |
-| `AGY_BRIDGE_MINIMAL_AGENT` | on | Set to `0` to keep agy's default prompt components (about 2,600 more input tokens per model call) |
+| `AGY_BRIDGE_THINKING` | on | Set to `0` to stop forwarding thought summaries; on new Magpie builds the Providers page switch takes precedence, only older hosts read this variable |
+| `AGY_BRIDGE_MINIMAL_AGENT` | on | Set to `0` to keep agy's default prompt components (about 2,600 more input tokens per model call); on new Magpie builds the Providers page switch takes precedence, only older hosts read this variable |
 | `AGY_BRIDGE_IDLE_MS` | 600000 | How long a process may sit idle before it is reclaimed; the session can still resume |
 | `AGY_BRIDGE_RESUME_TTL_MS` | 21600000 | How long a reclaimed session stays resumable (6 hours) |
 | `AGY_BRIDGE_STATE_FILE` | `$XDG_STATE_HOME/magpie-agy-bridge/sessions.json` | Where resumable session records are kept |
@@ -139,6 +169,135 @@ measurable data shows "Limits not available" rather than a fake 0% or 100%.
 | `AGY_BRIDGE_MAX_PROMPT_BYTES` | 114688 (112 KiB) | Byte budget for the replayed history prompt |
 | `AGY_BRIDGE_USAGE_TIMEOUT_MS` | 15000 | Total time budget for a usage query, capped at 18000 |
 | `AGY_BRIDGE_MCP_TRACE` | unset | Writes MCP channel traffic to the given file; for debugging only |
+
+## Plugin options
+
+New Magpie builds offer two configuration entry points that take effect
+differently:
+
+- **Providers-page switches** (immediate): three boolean switches for this
+  provider on Magpie's Providers page; the host re-reads them on every call,
+  so a flip applies to the next request without restarting:
+
+  | Switch | Default | What it does |
+  |---|---|---|
+  | `thinking_summary` | on | Forward agy thought summaries. Off: responses carry no `thinking` blocks, same as `AGY_BRIDGE_THINKING=0` |
+  | `minimal_agent` | on | Run agy with a minimal isolated agent. Off keeps agy's default prompt components, costing about 2,600 more input tokens per model call; applies to newly started agy processes, and the next request swaps an incompatible process through the existing retire path |
+  | `auto_switch` | off | When the current agy account runs out of quota, switch to the next captured account: stop the plugin's own agy processes, rewrite the account files under `~/.gemini`, and keep serving. One account at a time; see "Multi-account auto-switching" below for the full behavior, prerequisites and limits |
+
+  Older hosts without these switches keep using the environment variables
+  above and the defaults.
+
+- **Plugin Options JSON** (restart required): edit the JSON in Magpie's
+  "Plugins → Installed → Options"; it is passed to the plugin entry as the
+  second argument and takes effect after the host restarts:
+
+  ```json
+  {
+    "agyPath": "",
+    "maxProcs": 16,
+    "accounts": [],
+    "idleMs": 600000,
+    "resumeTtlMs": 21600000
+  }
+  ```
+
+  - `agyPath`: absolute path to the agy executable; priority is `agyPath` >
+    `AGY_PATH` > PATH lookup.
+  - `maxProcs`: pool limit, an integer between 1 and 64; keep it equal to the
+    provider's Concurrency on the Providers page, otherwise extra requests
+    queue or 503; overrides `AGY_BRIDGE_MAX_PROCS`.
+  - `accounts`: emails that take part in auto-switching, rotated in order; empty
+    falls back to active+old discovery from `~/.gemini/google_accounts.json`.
+    Accounts without a captured token backup are skipped (see "Multi-account
+    auto-switching").
+  - `idleMs` / `resumeTtlMs`: idle reclaim and parked-session resume windows
+    in milliseconds; override `AGY_BRIDGE_IDLE_MS` / `AGY_BRIDGE_RESUME_TTL_MS`.
+  - Priority for every key is JSON > matching environment variable > default;
+    an invalid value fails the plugin load naming the key, and empty strings
+    and `null` count as unset.
+  - The CLI works too: `magpie plugin options yce-magpie-agy '{"maxProcs":8}'`,
+    and `magpie plugin options yce-magpie-agy off` clears it.
+
+## Multi-account auto-switching
+
+When enabled, the plugin stops its own agy processes as soon as the current agy
+account runs out of quota, switches the local CLI to the next usable account,
+and keeps serving. One account is used at a time; there is no parallel use.
+
+**Prerequisites**
+
+1. Turn on the Auto-switch switch on the Providers page (off by default; hosts
+   without these switches never auto-switch).
+2. For each account, sign in once by running `agy` in a terminal, then send one
+   request through Magpie: on the next agy process start the plugin captures a
+   token backup for that account. Accounts without a backup are never switched
+   to.
+3. If the plugin Options `accounts` array is empty, candidates are discovered
+   from the active+old lists in `~/.gemini/google_accounts.json`; if it is set,
+   accounts rotate in the given order.
+
+**What triggers a switch**
+
+- Only account-quota errors (`QUOTA_EXHAUSTED` / `RESOURCE_EXHAUSTED`) trigger a
+  switch. `MODEL_CAPACITY_EXHAUSTED` (the server side is out of capacity; another
+  account will not help) and plain 429s do not.
+- A usage window at 98% or more only records a cooldown (until the window resets,
+  or one hour when the reset time is unknown); it never switches on its own, and
+  an account that can still serve other model groups is not switched away.
+- Expired or revoked tokens (authentication failures) do not switch either: the
+  current account is cooled down for an hour and the quota view asks for a new
+  sign-in.
+- The request that triggered the switch still answers HTTP 429 as before; the
+  plugin never replays it itself (the stream may already have produced output or
+  tool calls), the client retries.
+
+**The switch itself**
+
+1. Every agy process the plugin owns is stopped: idle ones are retired, a turn
+   that is still streaming may finish naturally within 120 seconds, and a turn
+   waiting on a client tool result is reclaimed immediately — the client receives
+   a short explanation and replays from history on its next request.
+2. The switch takes the same lock as external switchers such as `agy-quota.py`,
+   `~/.better-harness/agy-switch.lock` (on native Windows, a
+   `%USERPROFILE%\.better-harness\agy-switch.lock.d` directory lock); if the lock
+   is held, another switch is in progress and this one is skipped.
+3. If any agy process outside the plugin is running, or process state cannot be
+   verified, the switch is skipped.
+4. The account files under `~/.gemini` (`google_accounts.json` and the OAuth
+   token file) are rewritten: the current account is backed up first, writes are
+   atomic and read back, and any failure restores the previous content.
+5. Parked sessions belonging to the old account are no longer resumed; they start
+   a new session and replay history (switching back inside the resume window
+   restores them). The model catalog is rediscovered for the new account. Logs
+   carry masked emails and the reason only, never tokens.
+
+When every candidate account is in cooldown, no switch happens and the quota
+view reports the earliest recovery time.
+
+**WSL hosts**: auto-switching does nothing inside WSL and no backup vault is
+created — the local agy launcher wrapper overwrites the WSL account with the
+Windows-side one on every launch, so a switch inside WSL would be undone
+immediately. Enable it on the Windows host instead; after a switch there, the
+wrapper synchronizes the WSL side on the next launch.
+
+**Backups and cleanup**: token backups live in the plugin's own state directory
+`$XDG_STATE_HOME/magpie-agy-bridge/accounts/` (`~/.local/state/…` by default;
+the same layout under `%USERPROFILE%` on native Windows), directory mode 0700
+and file mode 0600, one JSON per account named by a hash of the email; the
+`cooldown.json` table lives there too. While the switch is on, quota window
+names carry the current account's masked address (for example
+`a***@g***.com · Gemini · Weekly`). Turning Auto-switch off restores the old
+behavior (account files are no longer read); deleting the `accounts/` directory
+removes every trace.
+
+**Note**: the plugin's lock on a Windows host and `agy-quota.py --switch` inside
+WSL cannot see each other; do not run both at the same time while auto-switching
+is on.
+
+All of the above is covered by automated tests against a fake agy with a
+temporary HOME (115 tests / 338 checks). Native Windows has not been verified
+end-to-end; the manual steps live under "Platforms".
 
 ## Troubleshooting
 
@@ -160,7 +319,8 @@ measurable data shows "Limits not available" rather than a fake 0% or 100%.
   rewrote the history or tool IDs mid-conversation. When the plugin can work out
   the correct match it rebuilds the session; when it cannot, it refuses rather
   than guessing.
-- **Turning thought summaries off**: set `AGY_BRIDGE_THINKING=0`, or send
+- **Turning thought summaries off**: on new Magpie builds use the Providers page
+  switch (older hosts: `AGY_BRIDGE_THINKING=0`), or send
   `thinking: { "type": "disabled" }` with the request.
 
 ## Development

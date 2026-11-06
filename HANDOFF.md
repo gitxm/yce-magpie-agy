@@ -1,3 +1,41 @@
+## 2026-11-06：多账号自动切号与插件选项
+
+本段记录当日第二轮改动（版本升至 0.2.0）；建仓与 provider ID 事项见下一段。
+
+- 三件事：删除全局强制思考档位环境变量（思考档位完全跟随请求）；插件入口改为
+  `(input, packageOptions)` 双参签名并落地运行期配置层；多账号串行自动切号
+  （账号仓库、切号编排、usage 掩码）。
+- **实现要点**：
+  - 入口签名：`AntigravityBridgePlugin(input, packageOptions)`，无参调用（旧宿主、
+    测试）照常工作；`hostInput` / `packageConfig` 存模块级变量。
+  - `hostOption(key, envName, fallback)`：Providers 页开关现读 > 旧宿主环境变量 >
+    默认值；`auto_switch` 无对应环境变量，旧宿主恒为关。
+  - 配置层 `validatePackageOptions`：只认 `agyPath` / `maxProcs` / `accounts` /
+    `idleMs` / `resumeTtlMs`，非法值让插件初始化直接抛错并写明键名；优先级
+    JSON > 环境变量 > 默认。
+  - 账号仓库 `accounts.mjs`：候选发现（`accounts` 非空按序、空则 active+old）、
+    令牌备份仓库 `$XDG_STATE_HOME/magpie-agy-bridge/accounts/`（目录 0700、
+    文件 0600、按邮箱哈希命名）、POSIX 与 `agy-quota.py` 共用
+    `~/.better-harness/agy-switch.lock`（flock 持锁子进程）、Windows 原生
+    `agy-switch.lock.d` 目录锁、外部 agy 在途检测、原子写入＋回读校验＋失败还原。
+  - 切号编排：`QUOTA_EXHAUSTED` / `RESOURCE_EXHAUSTED` 在 turn 结束后异步触发；
+    `MODEL_CAPACITY_EXHAUSTED` 与普通 429 不触发；认证失败不切号、只把当前号
+    冷却 1 小时。流程＝关闸（请求等闸上限 120 秒，超时 503）→ 排空（空闲回收、
+    出字等 120 秒、等工具结果的 turn 立即收回并附说明）→ 拿锁 → 在途检查 →
+    采集＋原子写账号文件 → 模型目录重置回 fallback。会话停车条目按账号隔离，
+    旧格式条目在首次切号时统一标记切号前账号。usage 窗口用量 ≥98% 只记冷却
+    （`accounts/cooldown.json`），不主动切；WSL 宿主不生效（启动包装器按 Windows
+    侧账号覆盖）。
+  - usage：开关开时窗口名前缀当前账号掩码（`a***@g***.com`，地址取自令牌文件，
+    不从 /usage 借），冷却／两处账号文件不一致／WSL 宿主等状态写进 `error`。
+- **验证口径**：全部假 agy＋临时 HOME；`npm test` 115 tests / 338 checks 全绿。
+  Windows 原生仅命令构造单测（目录锁、tasklist 命令），未端到端验证；人工复现
+  五步见 README「平台」，尚未执行。
+- **遗留**：方案B（每账号独立目录并行）未做；Antigravity-Manager 未集成
+  （`managerUrl` 未实现）；账号掩码在 `index.mjs` 与 `usage.mjs` 各有一份实现，
+  待收敛；Windows 插件锁与 WSL 侧 `agy-quota.py --switch` 的跨端互斥未打通
+  （README 已提醒别同时用）。
+
 ## 2026-11-06：独立建仓为 @magpie-community/yce-magpie-agy v0.1.0
 
 - 包名改为 `@magpie-community/yce-magpie-agy`，版本 `0.1.0`，仓库 `github:gitxm/yce-magpie-agy`

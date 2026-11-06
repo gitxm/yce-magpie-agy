@@ -22,7 +22,7 @@ GPT-OSS 模型，请求实际由 `agy` 进程完成。
 
 - **订阅内的模型都能用**：Gemini、Claude、GPT-OSS 等模型在会话中切换，历史保留；思考
   等级也可以在会话中切换。
-- **流式输出与思考摘要**：思考摘要以 `thinking` 块返回，设置 `AGY_BRIDGE_THINKING=0` 可关闭。
+- **流式输出与思考摘要**：思考摘要以 `thinking` 块返回，新版 Magpie 在 Providers 页关闭，旧宿主用 `AGY_BRIDGE_THINKING=0` 关闭。
 - **图片输入**：支持内联 base64 的 PNG、JPEG、GIF、WebP。需要 agy 1.5.0 或更新版本，
   因为图片能力要由 ACP 服务端声明。
 - **工具调用**：支持并行和连续调用。运行超过 150 秒的工具会先收到 "still running" 的
@@ -32,6 +32,9 @@ GPT-OSS 模型，请求实际由 `agy` 进程完成。
 - **隔离运行**：不读取你的全局 MCP 配置。每个 agy 进程使用临时 agent。agy 发起的权限
   请求（shell、写文件、浏览器等）一律拒绝，真正的操作都在客户端侧完成。
 - **额度查看**：在 Magpie 里查看 agy 订阅的用量窗口，仅作展示，额度耗尽时不会自动拦截请求。
+- **多账号自动切号**：当前 agy 账号额度用尽时，插件自动停掉自有 agy 进程，把本机 agy 切到
+  下一个已采集备份的账号继续服务。默认关闭，在 Providers 页开启；同一时间只用一个账号，
+  详见下文「多账号自动切号」。
 
 ## 环境要求
 
@@ -66,7 +69,8 @@ magpie plugin add ./yce-magpie-agy
 ## 使用
 
 1. 在 Magpie 的 Providers 页找到 `yce-magpie-agy` 并点击 Sign in。插件会用 `agy models`
-   确认 CLI 可用。Google 凭据始终由 agy 自己保管，插件不读取、不保存。
+   确认 CLI 可用。Google 凭据始终由 agy 自己保管，插件默认不读取、不保存；只有开启
+   「多账号自动切号」后，插件才会读取并备份令牌文件（见下文）。
 2. 模型名写成 `yce-magpie-agy/<模型>`。agy 对同一模型不同思考等级给出的多个模型 ID，
    在这里会合并成一个模型的多个变体，请求时再映射回对应的 agy ID。
 3. 在客户端里选用这个模型即可。
@@ -85,6 +89,21 @@ magpie plugin add ./yce-magpie-agy
 - **原生 Windows**：支持 `.exe`、`.cmd`、`.bat` 的查找与启动，后台更新检查不弹控制台窗口，
   并支持 `magpie quota`。目前只有命令构造的单元测试，尚未在 Windows 实机完成端到端验证。
 
+### Windows 原生人工复现步骤（多账号自动切号）
+
+以下五步用于人工验证自动切号在 Windows 原生宿主上的行为，**尚未执行**，Windows 原生未端到端验证：
+
+1. 在 Magpie Providers 页打开 Auto-switch 开关（令牌备份只在该开关开启后进行），两个
+   Google 账号各自在终端跑一次 `agy` 完成登录；每次登录后在 Magpie 发一条请求，让插件
+   采集该账号的令牌备份。
+2. 插件 Options 填 `{"accounts":["A","B"]}`（A、B 换成两个账号邮箱；留空则按 active+old
+   自动发现），重启宿主。
+3. 用账号 A 把某个模型组的额度耗尽（或等真实耗尽）：确认请求仍回 HTTP 429，随后
+   `%USERPROFILE%\.gemini\google_accounts.json` 的 `active` 变为 B，
+   `magpie quota yce-magpie-agy --json` 的窗口名前缀变成 B 的掩码。
+4. 另开一个终端跑着 `agy` 再触发切号：确认插件不切号，并在 quota 的 error 里报「在途」。
+5. WSL 里跑一次 `agy --version`：确认启动包装器把 WSL 侧账号同步成 B。
+
 ## 额度
 
 ```sh
@@ -93,8 +112,9 @@ magpie quota refresh yce-magpie-agy --json
 ```
 
 额度数据来自 agy 自己的 `/usage` 报告，显示的是当前 agy 登录账号的订阅窗口，按模型组
-分别列出。插件不读写 Google 令牌，也不会替你伪装成其他账号。没有可测量数据的窗口会显示
-"Limits not available"，而不是 0% 或 100%。
+分别列出。自动切号关闭时插件不读写 Google 令牌，也不会替你伪装成其他账号；开启自动切号后，
+插件会读取令牌文件来做备份与显示当前账号掩码（见「多账号自动切号」）。没有可测量数据的窗口
+会显示 "Limits not available"，而不是 0% 或 100%。
 
 ## 环境变量
 
@@ -102,9 +122,8 @@ magpie quota refresh yce-magpie-agy --json
 |---|---|---|
 | `AGY_PATH` | 按 PATH 查找 | 指定 agy 可执行文件 |
 | `AGY_BRIDGE_MAX_PROCS` | 16 | agy 进程池上限 |
-| `AGY_BRIDGE_THINKING` | 开启 | 设为 `0` 关闭思考摘要 |
-| `AGY_BRIDGE_EFFORT` | 未设置 | 强制思考等级：`minimal` / `low` / `medium` / `high` / `xhigh` / `max` |
-| `AGY_BRIDGE_MINIMAL_AGENT` | 开启 | 设为 `0` 保留 agy 默认提示组件，每次模型调用多约 2,600 个输入 token |
+| `AGY_BRIDGE_THINKING` | 开启 | 设为 `0` 关闭思考摘要；新版 Magpie 以 Providers 页开关为准，旧宿主才读该环境变量 |
+| `AGY_BRIDGE_MINIMAL_AGENT` | 开启 | 设为 `0` 保留 agy 默认提示组件，每次模型调用多约 2,600 个输入 token；新版 Magpie 以 Providers 页开关为准，旧宿主才读该环境变量 |
 | `AGY_BRIDGE_IDLE_MS` | 600000 | 进程空闲多久后回收（会话仍可续接） |
 | `AGY_BRIDGE_RESUME_TTL_MS` | 21600000 | 回收后的会话可续接的时长（6 小时） |
 | `AGY_BRIDGE_STATE_FILE` | `$XDG_STATE_HOME/magpie-agy-bridge/sessions.json` | 会话状态文件路径 |
@@ -114,6 +133,93 @@ magpie quota refresh yce-magpie-agy --json
 | `AGY_BRIDGE_MAX_PROMPT_BYTES` | 114688（112 KiB） | 重放历史提示词的字节预算 |
 | `AGY_BRIDGE_USAGE_TIMEOUT_MS` | 15000 | 额度查询的总时间预算，最高 18000 |
 | `AGY_BRIDGE_MCP_TRACE` | 未设置 | 把 MCP 通道流量写入指定文件，仅用于排查 |
+
+## 插件选项
+
+新版 Magpie 提供两个配置入口，生效方式不同：
+
+- **Providers 页开关**（即时生效）：在 Magpie 的 Providers 页对本提供商可切换三个布尔开关，宿主每次调用现读，改动立即对后续请求生效，无需重启：
+
+  | 开关 | 默认 | 作用 |
+  |---|---|---|
+  | `thinking_summary` | 开 | 转发 agy 思考摘要。关闭后响应不再携带 `thinking` 块，等价于旧版设置 `AGY_BRIDGE_THINKING=0` |
+  | `minimal_agent` | 开 | 以最小隔离 agent 运行 agy。关闭后保留 agy 默认提示组件，每次模型调用多约 2,600 个输入 token；只对新启动的 agy 进程生效，开关变化后下一次请求会按既有不兼容路径换新进程 |
+  | `auto_switch` | 关 | 当前 agy 账号额度用尽时，自动切到下一个已采集账号：停掉插件自有 agy 进程、改写 `~/.gemini` 下的账号文件、换号后继续服务。同一时间只用一个账号；完整行为、前提与限制见下文「多账号自动切号」 |
+
+  旧宿主（没有 Providers 页开关的 Magpie）不读这些开关，仍按上表环境变量与默认值工作。
+
+- **插件 Options JSON**（改完需重启宿主）：在 Magpie 的「插件 → 已安装 → Options」里编辑 JSON，保存后作为插件入口第二参数传入，重启宿主后生效：
+
+  ```json
+  {
+    "agyPath": "",
+    "maxProcs": 16,
+    "accounts": [],
+    "idleMs": 600000,
+    "resumeTtlMs": 21600000
+  }
+  ```
+
+  - `agyPath`：agy 可执行文件绝对路径；优先级 `agyPath` > `AGY_PATH` > 按 PATH 查找。
+  - `maxProcs`：进程池上限，1-64 的整数；建议与 Providers 页该提供商的 Concurrency 保持一致，否则多出的请求会排队或 503；优先级高于 `AGY_BRIDGE_MAX_PROCS`。
+  - `accounts`：参与自动切号的账号邮箱数组，按顺序轮转；留空时按 `~/.gemini/google_accounts.json` 的 active+old 自动发现。数组里没有令牌备份的账号会被跳过（见「多账号自动切号」）。
+  - `idleMs` / `resumeTtlMs`：进程空闲回收、停车会话可续接的时长（毫秒）；优先级高于 `AGY_BRIDGE_IDLE_MS` / `AGY_BRIDGE_RESUME_TTL_MS`。
+  - 各键优先级一律是 JSON > 对应环境变量 > 默认值；非法值会让插件加载直接失败并写明键名，空串与 `null` 视为未设置。
+  - 命令行同样可写：`magpie plugin options yce-magpie-agy '{"maxProcs":8}'`，`magpie plugin options yce-magpie-agy off` 清除。
+
+## 多账号自动切号
+
+开启后，当前 agy 账号额度用尽时，插件会自动停掉自己的 agy 进程、把本机 agy 切到下一个可用
+账号再继续服务。同一时间只用一个账号，不做多账号并行。
+
+**前提**
+
+1. Providers 页打开 Auto-switch 开关（默认关闭；旧宿主没有该开关，自动切号恒为关）。
+2. 每个账号首次使用前，在终端跑一次 `agy` 用该账号完成登录，随后在 Magpie 发一条请求——
+   插件在下一次启动 agy 进程时把该账号的令牌备份下来。仓库里没有备份的账号不会被切到。
+3. 插件 Options 的 `accounts` 留空时，按 `~/.gemini/google_accounts.json` 的 active+old
+   自动发现候选账号；填了就按给定顺序轮转。
+
+**触发条件**
+
+- 只认账号额度用尽的报错（`QUOTA_EXHAUSTED` / `RESOURCE_EXHAUSTED`）；
+  `MODEL_CAPACITY_EXHAUSTED`（服务端整体容量不足，换号无用）和普通 429 不触发切号。
+- 额度窗口用量达到 98% 只记冷却（到期时间取窗口的重置时间，取不到记 1 小时），不会主动
+  切号，也不把仍能跑其他模型组的账号切走。
+- 令牌过期或被吊销（认证失败）同样不切号：当前账号冷却 1 小时，额度页提示需重新登录。
+- 触发切号的那次请求仍按原样回 HTTP 429，插件不自动重发（流可能已输出过内容或工具调用，
+  重发会重复副作用），由客户端重试。
+
+**切号过程**
+
+1. 停掉插件自己的全部 agy 进程：空闲进程直接回收；正在输出的对话最多等 120 秒自然结束；
+   正在等客户端工具结果的对话立即收回，客户端会收到一条说明文字，下一请求按历史重放。
+2. 与外部切号设施（如 `agy-quota.py`）共用同一把锁 `~/.better-harness/agy-switch.lock`
+   （Windows 原生为 `%USERPROFILE%\.better-harness\agy-switch.lock.d` 目录锁）；锁被占用
+   即「另一切号进行中」，本次不切。
+3. 检测到插件之外的 agy 进程正在运行、或无法核实进程状态时，本次不切。
+4. 改写 `~/.gemini` 下的账号文件（`google_accounts.json` 与 OAuth 令牌文件）：先备份当前
+   号，原子写入并回读校验，任一步失败自动还原为切换前的内容。
+5. 切号后旧账号名下的停车会话不再续接，走新会话＋历史重放；切回原账号且在续接时限内则
+   恢复。模型目录按新账号重新发现。日志只记邮箱掩码与原因，不写令牌。
+
+所有候选账号都在冷却时不切号，额度页报「所有账号额度用尽，最早恢复时间 …」。
+
+**WSL 宿主不生效**：插件运行在 WSL 里时自动切号不生效，也不创建备份仓库——本机 agy 启动
+包装器每次启动都会按 Windows 侧账号覆盖 WSL 账号，WSL 内切号会被立即冲掉。请在 Windows
+宿主上开启；Windows 宿主切号后，WSL 侧由包装器在下次启动时自动同步。
+
+**令牌备份与清理**：备份放在插件自己的状态目录 `$XDG_STATE_HOME/magpie-agy-bridge/accounts/`
+（默认 `~/.local/state/…`，Windows 原生在 `%USERPROFILE%` 下同结构），目录权限 0700、文件
+0600，每个账号一个按邮箱哈希命名的 JSON，冷却表 `cooldown.json` 也在该目录。开关开启时，
+额度窗口名会加上当前账号的掩码前缀（如 `a***@g***.com · Gemini · Weekly`）。关闭 Providers
+页的 Auto-switch 即恢复旧行为（不再读账号文件）；彻底清理就删除整个 `accounts/` 目录。
+
+**注意**：Windows 宿主上的插件锁与 WSL 里的 `agy-quota.py --switch` 互相看不见，开了自动
+切号就别同时用 `agy-quota.py --switch`。
+
+以上行为全部由假 agy＋临时 HOME 的自动化测试覆盖（115 tests / 338 checks）；Windows 原生
+端到端未验证，人工复现步骤见「平台」。
 
 ## 常见排查
 
@@ -129,7 +235,7 @@ magpie quota refresh yce-magpie-agy --json
   从 agy 的日志中取出真实原因，并以错误结束本轮，不会当作正常回复输出。
 - **HTTP 409，提示工具结果与历史对不上**：通常是客户端在对话中途改写了历史或工具 ID。
   能确定对应关系时插件会重建会话；无法确定时直接拒绝，不做猜测。
-- **想关掉思考摘要**：设置 `AGY_BRIDGE_THINKING=0`，或者在请求里带上
+- **想关掉思考摘要**：新版 Magpie 在 Providers 页关闭（旧宿主仍可用 `AGY_BRIDGE_THINKING=0`），或者在请求里带上
   `thinking: { "type": "disabled" }`。
 
 ## 开发
