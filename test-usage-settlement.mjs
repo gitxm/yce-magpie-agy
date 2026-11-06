@@ -77,7 +77,12 @@ test("单步回合精确透传 ACP usage 并原样保留原始对象", async () 
       output_tokens_details: { thinking_tokens: 5 },
     })
     const start = responses[0].events.find((item) => item.event === "message_start")
-    assert.deepEqual(plain(start.data.message.usage), { input_tokens: 0, output_tokens: 0 })
+    // 上下文下限移植（fix ③）后 message_start 带请求体的非零估算输入，不再是全 0：
+    // 断言 output 为 0、输入为正且落在同一估算基数的有界范围内。
+    const startUsage = plain(start.data.message.usage)
+    assert.equal(startUsage.output_tokens, 0)
+    assert.ok(startUsage.input_tokens + startUsage.cache_read_input_tokens + startUsage.cache_creation_input_tokens >= 1,
+      `message_start 输入估算应为非零，实际 ${JSON.stringify(startUsage)}`)
     const [turn] = kit.turns
     assert.deepEqual(plain(turn.rawUsage), raw)
     assert.equal(turn.rawAcpUsages.length, 1)
@@ -539,7 +544,9 @@ test("单步校准系数与缓存占比只在同一 Proc 内沿用，不同 Proc
 })
 
 test("校准系数被夹在 [0.5, 1.5]", async () => {
-  for (const [factor, clamped] of [[3, 1.5], [0.1, 0.5]]) {
+  // 上下文下限移植（fix ②）后：低于半窗的样本按增量口径对待，不参与校准，
+  // 故 0.1 档不再把 scale 夹到 0.5，而是维持原值 1；上界 3 档仍夹到 1.5。
+  for (const [factor, expected] of [[3, 1.5], [0.1, 1]]) {
     await withKit({}, async (kit) => {
       const base = await padBodyToTokens(kit, baseBody({ messages: [{ role: "user", content: `clamp ${factor}` }] }), 4000)
       kit.prompts.push(async (agent) => {
@@ -558,7 +565,7 @@ test("校准系数被夹在 [0.5, 1.5]", async () => {
       }
       const second = await runTurn(kit, followUp)
       const total = usageTotal(second.responses[0].usage)
-      assert.ok(Math.abs(total - second.estimates[0] * clamped) <= 2, `系数 ${factor} 应夹到 ${clamped}，实际 ${total / second.estimates[0]}`)
+      assert.ok(Math.abs(total - second.estimates[0] * expected) <= 2, `系数 ${factor} 应得到 ${expected}，实际 ${total / second.estimates[0]}`)
     })
   }
 })

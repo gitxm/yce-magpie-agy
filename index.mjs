@@ -823,7 +823,10 @@ class Turn {
     if (!final) this.toolResponseCount++
     const total = usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens
     const estimate = this.stepInputEstimates[step.estimateIndex] || step.inputEstimate
-    if (calibrate && total > 0) {
+    // Calibrate only from samples of context magnitude. An incremental ACP
+    // result.usage (a fraction of the window) or a synthesized floor value
+    // would otherwise drag inputTokenScale to its lower clamp for later steps.
+    if (calibrate && total > 0 && estimate > 0 && total >= 0.5 * estimate && step.usageKind !== "context_floor") {
       this.proc.inputTokenScale = Math.max(0.5, Math.min(1.5, total / estimate))
       this.proc.lastCacheRatio = Math.max(0, Math.min(1, usage.cache_read_input_tokens / total))
     }
@@ -3816,6 +3819,22 @@ function responseOutputEstimate(content) {
   return { output: tokenCount(output), thinking: tokenCount(thinking) }
 }
 
+function inputTokenScaleOf(proc) {
+  return Number.isFinite(proc.inputTokenScale) ? Math.max(0.5, Math.min(1.5, proc.inputTokenScale)) : 1
+}
+
+function cacheRatioOf(proc) {
+  return Number.isFinite(proc.lastCacheRatio) ? Math.max(0, Math.min(1, proc.lastCacheRatio)) : 0
+}
+
+// Input-side usage fields derived from a request-body estimate (the same basis
+// the intermediate tool steps use), split by the session's last cache ratio.
+function estimatedInputUsage(proc, estimate) {
+  const input = Math.max(1, tokenCount(estimate * inputTokenScaleOf(proc)))
+  const read = Math.min(input, tokenCount(input * cacheRatioOf(proc)))
+  return { input_tokens: input - read, cache_read_input_tokens: read, cache_creation_input_tokens: 0 }
+}
+
 // Usage for one HTTP response. ACP reports one accumulated total for a whole
 // session/prompt, which may span several HTTP responses (tool round-trips and
 // late tool results). Reporting that total on the last response makes clients
@@ -3824,7 +3843,9 @@ function responseOutputEstimate(content) {
 //   - tool-step responses get a non-zero estimate scaled by what earlier
 //     responses taught us about this model's tokenizer and cache hit rate;
 //   - the final response gets the ACP input total split by this step's share
-//     of the estimated input, never above 1.5x its own estimate.
+//     of the estimated input, never above 1.5x its own estimate;
+//   - an incremental ACP result.usage (a fraction of the window) is lifted to
+//     the estimate basis so the reported window never collapses.
 function responseUsage(proc, turn, step, content, result) {
   if (step.settled) return step.usage
   const final = result !== undefined
@@ -3832,11 +3853,21 @@ function responseUsage(proc, turn, step, content, result) {
   const single = final && result?.stopReason !== "cancelled" && !turn.calls.length &&
     !turn.toolResponseCount && !turn.hasLatePrompt && turn.promptCount <= 1 && turn.responseSteps.length === 1
   step.usageKind = single && translated ? "exact" : "bounded_step_estimate"
-  if (single && translated) return translated
 
   const estimate = turn.stepInputEstimates[step.estimateIndex] || step.inputEstimate
-  const scale = Number.isFinite(proc.inputTokenScale) ? Math.max(0.5, Math.min(1.5, proc.inputTokenScale)) : 1
-  let cacheRatio = Number.isFinite(proc.lastCacheRatio) ? Math.max(0, Math.min(1, proc.lastCacheRatio)) : 0
+  const scale = inputTokenScaleOf(proc)
+  // ACP result.usage can be incremental (a fraction of the window) instead of
+  // cumulative. A final input total below half of the scaled estimate is not a
+  // context size: report the estimate basis so the window never collapses.
+  const floor = estimate > 0 ? tokenCount(0.5 * estimate * scale) : 0
+  if (single && translated) {
+    const translatedTotal = translated.input_tokens + translated.cache_read_input_tokens + translated.cache_creation_input_tokens
+    if (!(floor > 0 && translatedTotal < floor)) return translated
+    step.usageKind = "context_floor"
+    return { ...translated, ...estimatedInputUsage(proc, estimate) }
+  }
+
+  let cacheRatio = cacheRatioOf(proc)
   let input = Math.max(1, tokenCount(estimate * scale))
   let write = 0
   if (final) {
@@ -3856,6 +3887,12 @@ function responseUsage(proc, turn, step, content, result) {
     const bounded = Math.min(tokenCount(estimate * 1.5), combined)
     write = combined > 0 ? Math.min(bounded, tokenCount(bounded * (write / combined))) : 0
     input = bounded - write
+    if (floor > 0 && input + write < floor) {
+      step.usageKind = "context_floor"
+      input = Math.max(1, tokenCount(estimate * scale))
+      write = 0
+      cacheRatio = cacheRatioOf(proc)
+    }
   }
   const read = Math.min(input, tokenCount(input * cacheRatio))
   const emitted = responseOutputEstimate(content)
@@ -4005,7 +4042,7 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
             content: [],
             stop_reason: null,
             stop_sequence: null,
-            usage: { input_tokens: 0, output_tokens: 0 },
+            usage: { ...estimatedInputUsage(proc, step.inputEstimate), output_tokens: 0 },
           },
         })
         pingTimer = setInterval(() => {
@@ -4156,7 +4193,7 @@ function estimateInputTokens(body) {
   return Math.max(1, total + images * 1600)
 }
 
-async function jsonResponseFromStream(stream, fallbackModel, fallbackId) {
+async function jsonResponseFromStream(stream, fallbackModel, fallbackId, fallbackInputUsage = null) {
   const reader = stream.getReader()
   const decoder = new TextDecoder()
   let buffer = ""
@@ -4168,7 +4205,8 @@ async function jsonResponseFromStream(stream, fallbackModel, fallbackId) {
     content: [],
     stop_reason: "end_turn",
     stop_sequence: null,
-    usage: { input_tokens: 0, output_tokens: 0 },
+    // Without a request body to estimate from, the usage stays at 0.
+    usage: { ...(fallbackInputUsage || { input_tokens: 0 }), output_tokens: 0 },
   }
   const blocks = new Map()
   let streamError = null
@@ -4245,7 +4283,7 @@ function streamResponse(proc, turn, body, signal) {
   const msgId = "msg_" + randomUUID().replace(/-/g, "").slice(0, 24)
   const stream = makeAnthropicStream(proc, turn, body, msgId, signal, step)
   if (body.stream === false) {
-    return jsonResponseFromStream(stream, body.model, msgId)
+    return jsonResponseFromStream(stream, body.model, msgId, estimatedInputUsage(proc, step.inputEstimate))
   }
   return new Response(stream, {
     status: 200,
