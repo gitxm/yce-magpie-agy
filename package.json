@@ -1,14 +1,14 @@
 {
-  "name": "magpie-agy",
-  "version": "0.2.0",
-  "description": "Antigravity subscription provider that bridges to a real agy CLI over the Agent Client Protocol (agy acp), avoiding HTTP impersonation",
+  "name": "@magpie-community/yce-magpie-agy",
+  "version": "0.1.0",
+  "description": "Magpie/OpenCode model provider that connects your local agy CLI through the Agent Client Protocol (agy acp), so Antigravity subscription models run through the real CLI",
   "type": "module",
   "main": "./index.mjs",
   "repository": {
     "type": "git",
-    "url": "https://github.com/gitxm/magpie-agy.git"
+    "url": "https://github.com/gitxm/yce-magpie-agy.git"
   },
-  "homepage": "https://github.com/gitxm/magpie-agy#readme",
+  "homepage": "https://github.com/gitxm/yce-magpie-agy#readme",
   "files": [
     "index.mjs",
     "platform.mjs",
@@ -35,7 +35,7 @@
   "license": "MIT",
   "magpie": {
     "icon": "https://raw.githubusercontent.com/yetone/magpie/v0.1.1356/internal/gui/assets/icons/antigravity-color.svg",
-    "maxConcurrency": 8
+    "maxConcurrency": 16
   },
   "engines": {
     "bun": ">=1.0.0"

@@ -1,14 +1,14 @@
-## 2026-11-06：独立建仓为 magpie-agy v0.2.0
+## 2026-11-06：独立建仓为 @magpie-community/yce-magpie-agy v0.1.0
 
-- 包名改为 `magpie-agy`，版本 `0.2.0`，仓库 `github:gitxm/magpie-agy`
-  （https://github.com/gitxm/magpie-agy）。安装：`magpie plugin add github:gitxm/magpie-agy`。
-- **Magpie provider ID 仍是 `antigravity-bridge`**（不是 `magpie-agy`），所以路由组、
-  亲和性、登录态和会话停车文件（`magpie-agy-bridge/sessions.json`）直接沿用。
-- 默认进程池并发上限 8（`magpie.maxConcurrency` 同为 8），可用 `AGY_BRIDGE_MAX_PROCS`、
+- 包名改为 `@magpie-community/yce-magpie-agy`，版本 `0.1.0`，仓库 `github:gitxm/yce-magpie-agy`
+  （https://github.com/gitxm/yce-magpie-agy）。安装：`magpie plugin add github:gitxm/yce-magpie-agy`。
+- **Magpie provider ID 改为 `yce-magpie-agy`**。旧 ID 写死的模型名与路由组要改名，登录态按 ID 记录，切换后需重新登录；
+  会话停车文件（`magpie-agy-bridge/sessions.json`）路径不变，已有会话可续接。切换顺序见 NOTICE.md 第 7 节。
+- 默认进程池并发上限 16（`magpie.maxConcurrency` 同为 16），可用 `AGY_BRIDGE_MAX_PROCS`、
   `AGY_BRIDGE_DETACHED_EVICT_MS`、`AGY_BRIDGE_MAX_PROMPT_BYTES` 调整。
 - 支持 macOS、Linux 与原生 Windows（含无弹窗后台更新屏蔽与 Windows 原生 `magpie quota`）。
 - 基线与逐项变更（上游主干、PR #8、本机补丁 A1–A16 / U1–U6）见 [NOTICE.md](NOTICE.md)。
-- 之前记录里的 `opencode-antigravity-bridge` 是旧包名与旧仓库，仅作历史描述。
+- 之前记录里的上游旧包名与旧仓库见 NOTICE.md，仅作历史描述，不再使用。
 
 ## 2026-11-05：整合 PR #4 与 agy 1.5.0，维护者追加修复
 
@@ -32,7 +32,7 @@ schema 校验），用户图片通过协商后的 ACP image capability 发送；
   1.5.0：图片识别、原生 MCP 工具调用、跨进程 resume、思考等级变更通过；
   Flash 未输出思考摘要，不宣称本轮验证了思考文本。
 
-# Handoff: magpie-agy
+# Handoff: yce-magpie-agy
 
 ## 2026-11-04：agy 1.5.0 图片输入和 ACP 配置选项
 
@@ -152,8 +152,8 @@ Magpie `5b4dec58` 的 host usage hook 及官方 Antigravity pools。设计和实
 包括 Gemini 4 Argon 独立周额度。该 host 验证使用临时 sentinel auth，未复制
 Google 凭据、未改现有 Magpie/agy 配置。未做 GUI 截图或 Linux 真实验证。
 
-查询：`magpie quota antigravity-bridge --json` 或
-`magpie quota refresh antigravity-bridge --json`（需安装的是更新后的代码）。
+查询：`magpie quota yce-magpie-agy --json` 或
+`magpie quota refresh yce-magpie-agy --json`（需安装的是更新后的代码；2026-11-06 起 provider ID 为 yce-magpie-agy）。
 截至本记录未推送、发布或替换用户当前安装。
 
 ## 2026-10-26：真实 OpenCode system-update 修复与本地验证
@@ -167,7 +167,7 @@ result 前 update 仍返回 400。
 Node/Bun 各 123 项 smoke checks 通过。真实 agy 1.3.5 + Magpie 0.1.1564 +
 OpenCode 2.1.2 的隔离本地链路已完成两次 shell 调用：第一次实际 exit 18，
 system-update 后续接，第二次成功，最终 end_turn，OpenCode exit 0。usage 明确
-为 antigravity-bridge 本地 provider，不是 remote-magpie。
+为本地 bridge provider，不是 remote-magpie。
 
 主配置 `noAccountDiscovery: true` 会同时过滤插件账号，导致本地 provider 不在
 catalog，完整模型 ID 随后被 remote-magpie 的嵌套 bare model 匹配。验证使用独立
@@ -224,7 +224,7 @@ Anthropic Messages 桥接到真实的 `agy` CLI，而不是复用订阅凭据并
 Antigravity IDE 的 HTTP 身份。真实 CLI 可以避免客户端身份伪造，但不能承诺
 账号永远不会受到平台限制。
 
-仓库：https://github.com/gitxm/magpie-agy
+仓库：https://github.com/gitxm/yce-magpie-agy
 
 当前状态：**原生 MCP 工具透传已实现**。基线 commit 为 `292fb05`；本文描述
 其后的工作区修改，不表示这些修改已经提交或发布。
@@ -396,16 +396,16 @@ Chat 风格。现在 provider 和模型都补全 OpenCode 的 `api: {id, url, np
 ## 开发命令
 
 ```sh
-git clone https://github.com/gitxm/magpie-agy
-cd magpie-agy
+git clone https://github.com/gitxm/yce-magpie-agy
+cd yce-magpie-agy
 node --check index.mjs
 node --check mcp-server.mjs
 node test-smoke.mjs
 npm pack --dry-run
 
 # 真实宿主验证（需要 magpie + 已登录 agy）
-magpie plugin add github:gitxm/magpie-agy
-# 或本地目录：magpie plugin add ./magpie-agy
+magpie plugin add github:gitxm/yce-magpie-agy
+# 或本地目录：magpie plugin add ./yce-magpie-agy
 ```
 
 ---

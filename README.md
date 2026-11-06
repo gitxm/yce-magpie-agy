@@ -1,141 +1,154 @@
-# magpie-agy
+# yce-magpie-agy
 
-把你的 **Antigravity 订阅**变成 OpenCode、Amp、Claude Code 等客户端的模型后端——
-Gemini、Claude、GPT-OSS 全系可用。
+把本机的 Antigravity CLI（`agy`）接成 Magpie 里的一个模型 provider。装好以后，
+OpenCode、Claude Code 等客户端经由 Magpie 调用你订阅里的 Gemini、Claude 和
+GPT-OSS 模型，请求实际由 `agy` 进程完成。
 
-> 包名是 `magpie-agy`（仓库 `github:gitxm/magpie-agy`），Magpie 里的 provider ID
-> 仍然是 `antigravity-bridge`，路由组和登录态直接沿用，不用重新配置。
-> 来源与变更清单见 [NOTICE.md](NOTICE.md)。
+**[English → README.en.md](README.en.md)** ｜ 来源、版权与迁移说明见 [NOTICE.md](NOTICE.md)
 
-**[English version → README.en.md](README.en.md)**
+## 这是什么
 
-## 它解决什么问题
+插件以 Magpie provider 的形式运行。客户端发来 Anthropic Messages 格式的请求，插件把它
+翻译成 ACP（Agent Client Protocol）消息，交给本机的 `agy acp` 进程处理，再把输出翻译回
+流式响应。
 
-- 已经订阅了 Antigravity（Google AI Pro/Ultra 附带），却还要为 Gemini / Claude API
-  另开一份付费？这个插件让订阅直接服务你的编码客户端。
-- 不用逆向私有接口、不用伪装 IDE：它驱动**真实的 `agy` CLI**，走官方
-  Agent Client Protocol（ACP），Google 看到的是正版 CLI 发出的请求。
-- 客户端的工具（读写文件、跑命令等）原生透传给模型，不是文本约定 hack。
+- 底层是真正的 agy CLI，走它自带的 ACP 通道。插件不伪造 IDE 身份，也不直接请求 Google
+  的内部接口。
+- 客户端自己的工具（读写文件、执行命令等）通过 MCP 暴露给模型。工具由客户端执行，结果
+  回传到同一轮 agy 对话里，模型看到的是原生工具调用。
+- 账号风险不由插件决定。Google 的使用政策变化时，插件无法替你保证账号不受限制。
 
-## 核心特性
+## 功能
 
-- **全订阅模型可用**：Gemini、Claude、GPT-OSS 一应俱全，会话中可随时切换模型
-  和思考等级。
-- **流式输出 + 思考摘要 + 图片输入**：文本、思考过程、图片按顺序完整呈现。
-- **Claude Code 兼容**：支持尾随 system/developer 上下文、hooks、Skill /
-  ToolSearch 工具附加内容和用户排队消息，兼容非流式 Messages 响应。
-- **工具调用零损耗**：客户端工具以 MCP 原生工具的形式出现在模型面前，
-  支持长任务、并行调用；工具跑得再久也不会丢结果。
-- **会话不丢**：每轮结束自动记录会话状态（只存哈希，不落明文），
-  重启 magpie 或插件后上下文原样续上。
-- **额度可见**：在 Magpie 的 Usage 页面直接查看 Antigravity 订阅额度。
-- **安全隔离**：不读取你的全局 MCP 配置和凭据；agy 的权限请求一律拒绝，
-  真正的操作都发生在客户端侧。
-- **省 token 实测**：见下。
+- **订阅内的模型都能用**：Gemini、Claude、GPT-OSS 等模型在会话中切换，历史保留；思考
+  等级也可以在会话中切换。
+- **流式输出与思考摘要**：思考摘要以 `thinking` 块返回，设置 `AGY_BRIDGE_THINKING=0` 可关闭。
+- **图片输入**：支持内联 base64 的 PNG、JPEG、GIF、WebP。需要 agy 1.5.0 或更新版本，
+  因为图片能力要由 ACP 服务端声明。
+- **工具调用**：支持并行和连续调用。运行超过 150 秒的工具会先收到 "still running" 的
+  占位响应，真正的结果送达后继续同一轮对话，每个调用只在客户端执行一次。
+- **会话续接**：每轮结束后记录会话。重启 Magpie 或插件后，只要历史和指令的哈希一致，
+  就用 `session/resume` 接上上下文。状态文件只存会话 ID 与哈希，不存消息原文。
+- **隔离运行**：不读取你的全局 MCP 配置。每个 agy 进程使用临时 agent。agy 发起的权限
+  请求（shell、写文件、浏览器等）一律拒绝，真正的操作都在客户端侧完成。
+- **额度查看**：在 Magpie 里查看 agy 订阅的用量窗口，仅作展示，额度耗尽时不会自动拦截请求。
 
-## 省 token 实测
+## 环境要求
 
-agy 默认 agent 自带约 8,000 tokens 的编码 prompt。本插件通过最小化 agent
-配置把这部分干掉——客户端自己的 system prompt 和工具目录本来就是权威来源：
+- Antigravity CLI（`agy`），带 `acp` 子命令，并且在终端里交互登录过一次 Google 账号。
+  文本与工具调用已在 1.4.12 和 1.5.0 上验证；图片输入需要 1.5.0。
+- 支持 OpenCode 风格 provider 插件的 Magpie。额度查询已在 Magpie 0.1.1599 上验证。
+- agy 版本低于 1.1.11 时，额度查询会被拒绝，以免旧版本把 `/usage` 当成模型提示词。
 
-| 场景 | input tokens |
-|---|---|
-| agy 默认 agent（"Reply OK"） | 8,357 |
-| 本插件（同一指令） | **509（-94%）** |
-| 三轮编码会话含一次工具调用 | **4,109 vs 15,351（-73%）** |
+## 安装
 
-Prompt caching 由 Google 后端决定，本插件让请求前缀尽量稳定：实测 26k token
-的稳定 prompt 下缓存命中率 **91.7%**，OpenCode 这类带工具定义的长 prompt
-通常在 90% 以上。每轮只发新增消息，不重放历史。
-
-完整数据、缓存分析和测量方法见 [README.en.md](README.en.md#token-cost)。
-
-## 30 秒上手
-
-前置要求：
-
-- 已安装 [magpie](https://github.com/yetone/magpie)，支持 OpenCode 风格插件
-- 已安装 [Antigravity CLI](https://antigravity.google)（`agy`）并至少交互式
-  登录过一次 Google 账号（实测版本 1.4.12 / 1.5.0）
+直接从 GitHub 安装：
 
 ```sh
-# 1. 安装插件（直接从 GitHub 安装，provider ID 仍是 antigravity-bridge）
-magpie plugin add github:gitxm/magpie-agy
-# 或本地 checkout：
-# git clone https://github.com/gitxm/magpie-agy && magpie plugin add ./magpie-agy
-
-# 2. 交互式运行一次 agy 完成 Google 登录
-agy
-
-# 3. 在 Magpie 中：Providers → Antigravity Bridge → Sign in
-# 4. 选一个模型（可选思考等级），开始对话
+magpie plugin add github:gitxm/yce-magpie-agy
 ```
 
-客户端侧零配置：不需要改全局 MCP 配置，插件为每个 agy 进程创建隔离的临时
-agent。
-
-## 它是怎么工作的
-
-```
-客户端 (OpenCode / Amp / Claude Code ...)
-  │  Anthropic Messages (POST /v1/messages, SSE)
-  ▼
-magpie 网关 ── antigravity-bridge provider（本插件）
-  │  ACP JSON-RPC over stdio
-  ▼
-agy acp          ← 真实的 Antigravity CLI 进程
-  │  客户端工具经私有 MCP 通道透传
-  ▼
-Google Code Assist 后端
-```
-
-会话、工具、取消、错误处理的完整协议细节见
-[README.en.md](README.en.md)。
-
-## 使用说明
-
-**切换模型 / 思考等级**：在 magpie 的模型选择器中切换即可，会话不中断，
-历史保留。
-
-**查看订阅额度**：
+插件进入社区市场后，改用：
 
 ```sh
-magpie quota antigravity-bridge --json
-magpie quota refresh antigravity-bridge --json
+magpie plugin add @magpie-community/yce-magpie-agy
 ```
 
-需要当前版本的 magpie（插件 usage 钩子，实测宿主 0.1.1599）。额度窗口仅作
-展示，不会自动在额度耗尽时停请求。
+从本地源码安装：
 
-**客户端工具行为**：工具调用对客户端透明——模型发起 `tool_use`，客户端执行后
-回传 `tool_result`，同一个 agy 回合继续。运行超过 150 秒的工具会先收到
-"still running" 响应，结果最终送达，客户端每个调用只执行一次。
+```sh
+git clone https://github.com/gitxm/yce-magpie-agy
+magpie plugin add ./yce-magpie-agy
+```
 
-## FAQ / 注意事项
+安装完成后，先在终端运行一次 `agy` 完成 Google 登录。
 
-- **图片**：只支持内联 base64（PNG/JPEG/GIF/WebP），不支持远程 URL 和二进制/PDF 文档；纯文本 document 和 search_result 可用。
-  需要服务端声明 ACP 图片能力（agy 1.5.0 起）。
-- **平台**：支持 macOS、Linux 和原生 Windows。Windows 含 `.exe` / `.cmd` / `.bat`
-  发现与启动、WSL 路径处理、无弹窗的后台更新屏蔽（子进程一律
-  `AGY_CLI_DISABLE_AUTO_UPDATE=true` 且 `windowsHide`），以及 Windows 原生
-  `magpie quota`（含进程树清理、浏览器拦截、临时目录重试删除）。
-- **进程池并发**：默认最多同时 8 个 agy 进程（`package.json` 的
-  `magpie.maxConcurrency` 也是 8），可用 `AGY_BRIDGE_MAX_PROCS` 调整；池满时优先淘汰空闲进程，
-  其次淘汰客户端已断开超过 30 秒的挂起工具回合（`AGY_BRIDGE_DETACHED_EVICT_MS`），
-  不再因挂起回合占池而报 503。
-- **长历史重放预算**：重放提示词默认限制在 112 KiB 内（`AGY_BRIDGE_MAX_PROMPT_BYTES`），
-  保证 `</conversation_history>` 与当前回合不会被 agy 的 128 KiB 截断切掉。
-- **账号**：一个 Google 账号（agy 自己的登录态）；插件不会调用 ACP
-  `authenticate` 去切换登录。
-- **会话状态文件**：`$XDG_STATE_HOME/magpie-agy-bridge/sessions.json`
-  （0600，仅哈希），可用 `AGY_BRIDGE_STATE_FILE` 覆盖。
-- **超时**：启动 60s、agy 空闲 5min、等客户端工具结果 30min，可用
-  `AGY_BRIDGE_START_TIMEOUT_MS` / `AGY_BRIDGE_TURN_TIMEOUT_MS` /
-  `AGY_BRIDGE_TOOL_TIMEOUT_MS` 调整。
+## 使用
 
-完整环境变量表、限制条件和开发/测试说明见
-[README.en.md](README.en.md#environment-variables)。
+1. 在 Magpie 的 Providers 页找到 `yce-magpie-agy` 并点击 Sign in。插件会用 `agy models`
+   确认 CLI 可用。Google 凭据始终由 agy 自己保管，插件不读取、不保存。
+2. 模型名写成 `yce-magpie-agy/<模型>`。agy 对同一模型不同思考等级给出的多个模型 ID，
+   在这里会合并成一个模型的多个变体，请求时再映射回对应的 agy ID。
+3. 在客户端里选用这个模型即可。
+
+## 并发
+
+- 插件自己的进程池上限由 `AGY_BRIDGE_MAX_PROCS` 决定，默认 16 个 agy 进程。
+- Magpie 的 Providers 页有单独的 Concurrency 设置，可填 0–1000，0 表示不限制。
+  你在页面里改的值会覆盖 `package.json` 里 `magpie.maxConcurrency` 的默认声明（16）。
+- 进程池已满、又找不到可以淘汰的进程时，插件返回 HTTP 503。建议两处数值保持一致：
+  Providers 页的并发数超过进程池上限，多出来的请求就会得到 503。
+
+## 平台
+
+- **macOS、Linux**：支持。
+- **原生 Windows**：支持 `.exe`、`.cmd`、`.bat` 的查找与启动，后台更新检查不弹控制台窗口，
+  并支持 `magpie quota`。目前只有命令构造的单元测试，尚未在 Windows 实机完成端到端验证。
+
+## 额度
+
+```sh
+magpie quota yce-magpie-agy --json
+magpie quota refresh yce-magpie-agy --json
+```
+
+额度数据来自 agy 自己的 `/usage` 报告，显示的是当前 agy 登录账号的订阅窗口，按模型组
+分别列出。插件不读写 Google 令牌，也不会替你伪装成其他账号。没有可测量数据的窗口会显示
+"Limits not available"，而不是 0% 或 100%。
+
+## 环境变量
+
+| 变量 | 默认值 | 作用 |
+|---|---|---|
+| `AGY_PATH` | 按 PATH 查找 | 指定 agy 可执行文件 |
+| `AGY_BRIDGE_MAX_PROCS` | 16 | agy 进程池上限 |
+| `AGY_BRIDGE_THINKING` | 开启 | 设为 `0` 关闭思考摘要 |
+| `AGY_BRIDGE_EFFORT` | 未设置 | 强制思考等级：`minimal` / `low` / `medium` / `high` / `xhigh` / `max` |
+| `AGY_BRIDGE_MINIMAL_AGENT` | 开启 | 设为 `0` 保留 agy 默认提示组件，每次模型调用多约 2,600 个输入 token |
+| `AGY_BRIDGE_IDLE_MS` | 600000 | 进程空闲多久后回收（会话仍可续接） |
+| `AGY_BRIDGE_RESUME_TTL_MS` | 21600000 | 回收后的会话可续接的时长（6 小时） |
+| `AGY_BRIDGE_STATE_FILE` | `$XDG_STATE_HOME/magpie-agy-bridge/sessions.json` | 会话状态文件路径 |
+| `AGY_BRIDGE_IDE_CALL_DEADLINE_MS` | 150000 | 工具运行超过该时间仍未结束时，先返回 "still running" |
+| `AGY_BRIDGE_START_TIMEOUT_MS` / `_TURN_TIMEOUT_MS` / `_TOOL_TIMEOUT_MS` | 60 秒 / 5 分钟 / 30 分钟 | 进程启动、agy 无输出、等待客户端工具结果的超时 |
+| `AGY_BRIDGE_DETACHED_EVICT_MS` | 30000 | 客户端已断开的挂起工具回合，最多占用进程池槽位这么久 |
+| `AGY_BRIDGE_MAX_PROMPT_BYTES` | 114688（112 KiB） | 重放历史提示词的字节预算 |
+| `AGY_BRIDGE_USAGE_TIMEOUT_MS` | 15000 | 额度查询的总时间预算，最高 18000 |
+| `AGY_BRIDGE_MCP_TRACE` | 未设置 | 把 MCP 通道流量写入指定文件，仅用于排查 |
+
+## 常见排查
+
+- **找不到 agy**：设置 `AGY_PATH` 指向可执行文件，或确认 `agy` 在 PATH 里。
+- **Sign in 失败或 agy 报登录相关错误**：在终端运行一次 `agy`，重新完成 Google 登录。
+- **HTTP 503**：进程池满。提高 `AGY_BRIDGE_MAX_PROCS` 和 Providers 页的 Concurrency，
+  或者减少同时进行的会话。
+- **额度显示 "Limits not available" 或报版本错误**：该窗口没有可测量的数据；版本错误则
+  把 agy 升级到 1.1.11 以上。
+- **图片请求返回 HTTP 400**：当前 agy 没有声明图片能力（需要 1.5.0 以上）。另外只接受
+  内联 base64，URL 图片和 PDF 等二进制文档都会被拒绝。
+- **回复里出现 "Agent execution terminated due to error."**：这是 agy 的错误标记。插件会
+  从 agy 的日志中取出真实原因，并以错误结束本轮，不会当作正常回复输出。
+- **HTTP 409，提示工具结果与历史对不上**：通常是客户端在对话中途改写了历史或工具 ID。
+  能确定对应关系时插件会重建会话；无法确定时直接拒绝，不做猜测。
+- **想关掉思考摘要**：设置 `AGY_BRIDGE_THINKING=0`，或者在请求里带上
+  `thinking: { "type": "disabled" }`。
+
+## 开发
+
+```sh
+node --check index.mjs
+node --check mcp-server.mjs
+node --check usage.mjs
+npm test
+npm pack --dry-run
+```
+
+`npm test` 用假的 agy 进程跑完整的 ACP 与 MCP 链路，不消耗额度。真实 CLI 的集成检查需要
+显式开启，并会消耗少量订阅额度：
+
+```sh
+AGY_BRIDGE_INTEGRATION=1 npm run test:integration
+```
 
 ## License
 
-MIT。版权与上游来源见 [LICENSE](LICENSE) 和 [NOTICE.md](NOTICE.md)。
+MIT。版权声明见 [LICENSE](LICENSE)，上游来源与逐项变更见 [NOTICE.md](NOTICE.md)。

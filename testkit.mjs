@@ -617,7 +617,7 @@ export const READ_TOOL = {
 
 export function baseBody(overrides = {}) {
   return {
-    model: "antigravity-bridge/gemini-4-argon[1m]",
+    model: "yce-magpie-agy/gemini-4-argon[1m]",
     max_tokens: 4096,
     stream: true,
     system: "You are a test agent.",

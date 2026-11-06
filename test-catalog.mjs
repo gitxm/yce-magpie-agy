@@ -208,11 +208,11 @@ test("各家族 limit 正确，未知动态型号不猜成 1M", async () => {
 
 test("gpt-oss-120b 裸名映射到 medium，请求型号尾部 [1m] 被剥除", async () => {
   const cases = [
-    ["antigravity-bridge/gpt-oss-120b", "gpt-oss-120b-medium", "gpt-oss-120b"],
-    ["antigravity-bridge/gpt-oss-120b[1m]", "gpt-oss-120b-medium", "gpt-oss-120b"],
-    ["antigravity-bridge/gpt-oss-120b-medium", "gpt-oss-120b-medium", "gpt-oss-120b-medium"],
-    ["antigravity-bridge/gemini-4-argon[1m]", "gemini-4-argon-high", "gemini-4-argon"],
-    ["antigravity-bridge/claude-sonnet-5-5[1M]", "claude-sonnet-5-5-high", "claude-sonnet-5-5"],
+    ["yce-magpie-agy/gpt-oss-120b", "gpt-oss-120b-medium", "gpt-oss-120b"],
+    ["yce-magpie-agy/gpt-oss-120b[1m]", "gpt-oss-120b-medium", "gpt-oss-120b"],
+    ["yce-magpie-agy/gpt-oss-120b-medium", "gpt-oss-120b-medium", "gpt-oss-120b-medium"],
+    ["yce-magpie-agy/gemini-4-argon[1m]", "gemini-4-argon-high", "gemini-4-argon"],
+    ["yce-magpie-agy/claude-sonnet-5-5[1M]", "claude-sonnet-5-5-high", "claude-sonnet-5-5"],
   ]
   for (const [requested, agyModel, echoed] of cases) {
     await withKit({ agyPath: undefined }, async (kit) => {

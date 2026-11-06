@@ -9,7 +9,7 @@ import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { createUsageReader } from "./usage.mjs"
 
-const PROVIDER_ID = "antigravity-bridge"
+const PROVIDER_ID = "yce-magpie-agy"
 const AGENT_NAME = "magpie-bridge"
 const MCP_SERVER_PATH = fileURLToPath(new URL("./mcp-server.mjs", import.meta.url))
 // agy exposes tools from the --ide-mcp-port server as direct functions with this prefix.
@@ -17,7 +17,7 @@ const IDE_TOOL_PREFIX = "mcp_ide-tools_"
 const IDLE_MS = positiveTimeout(process.env.AGY_BRIDGE_IDLE_MS, 10 * 60 * 1000)
 // Read at call time so a host (or a test) can size the pool without a reload.
 function maxProcs() {
-  return positiveTimeout(process.env.AGY_BRIDGE_MAX_PROCS, 8)
+  return positiveTimeout(process.env.AGY_BRIDGE_MAX_PROCS, 16)
 }
 // A tool turn whose client detached this long ago yields its process under pool pressure.
 function detachedEvictMs() {
