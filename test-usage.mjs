@@ -1,5 +1,6 @@
 import assert from "node:assert/strict"
 import childProcess, { spawnSync } from "node:child_process"
+import { readFileSync } from "node:fs"
 import { syncBuiltinESMExports } from "node:module"
 import fs from "node:fs/promises"
 import os from "node:os"
@@ -77,11 +78,30 @@ test("requires a successful usage command with at least one enabled measured buc
   }
 })
 
+async function waitForPidExit(pid, timeoutMs = 1000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    try {
+      process.kill(pid, 0)
+    } catch (err) {
+      if (err?.code === "ESRCH") return
+    }
+    await new Promise(resolve => setTimeout(resolve, 25))
+  }
+  assert.throws(() => process.kill(pid, 0), { code: "ESRCH" })
+}
+
 async function fixture(t, extraEnv = {}) {
+  const isWin = process.platform === "win32"
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "agy-usage-test-"))
-  t.after(() => fs.rm(directory, { recursive: true, force: true }))
+  t.after(async () => {
+    for (let i = 0; i < 6; i++) {
+      try { await fs.rm(directory, { recursive: true, force: true }); break }
+      catch { await new Promise(r => setTimeout(r, 50)) }
+    }
+  })
   const script = path.join(directory, "fake.mjs")
-  const executable = path.join(directory, "agy")
+  const executable = path.join(directory, isWin ? "agy.cmd" : "agy")
   const logPath = path.join(directory, "calls.jsonl")
   await fs.writeFile(script, String.raw`
 import { spawn, spawnSync } from "node:child_process"
@@ -89,13 +109,17 @@ import fs from "node:fs"
 import path from "node:path"
 const args = process.argv.slice(2)
 const version = args[0] === "--version"
+const guardRun = process.platform === "win32"
+  ? spawnSync(process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", "\"" + process.env.BROWSER + "\""], { windowsHide: true })
+  : spawnSync(process.env.BROWSER)
 const record = {
   args, cwd: process.cwd(), pid: process.pid,
   update: process.env.AGY_CLI_DISABLE_AUTO_UPDATE,
   path: process.env.PATH, browser: process.env.BROWSER,
+  browserContent: (() => { try { return fs.readFileSync(process.env.BROWSER, "utf8") } catch { return null } })(),
   agent: fs.readFileSync(path.join(process.cwd(), ".agents/agents/magpie-usage/agent.md"), "utf8"),
   mode: fs.statSync(process.cwd()).mode & 0o777,
-  guard: spawnSync(process.env.BROWSER).status,
+  guard: guardRun.status,
 }
 fs.appendFileSync(process.env.TEST_LOG, JSON.stringify(record) + "\n")
 const mode = process.env.TEST_MODE
@@ -113,7 +137,7 @@ else if (version) {
 } else if (mode === "malformed") {
   console.log("invalid secret@example.com")
 } else if (mode === "descendant") {
-  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "inherit" })
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "inherit", windowsHide: true })
   fs.writeFileSync(process.env.TEST_DESCENDANT, String(child.pid))
   child.unref()
   console.log(process.env.TEST_REPORT)
@@ -122,7 +146,11 @@ else if (version) {
   console.log(process.env.TEST_REPORT)
 }
 `)
-  await fs.writeFile(executable, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(script)} "$@"\n`, { mode: 0o700 })
+  if (isWin) {
+    await fs.writeFile(executable, `@echo off\r\n"${process.execPath}" "${script}" %*\r\n`)
+  } else {
+    await fs.writeFile(executable, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(script)} "$@"\n`, { mode: 0o700 })
+  }
   const env = { ...process.env, TEST_LOG: logPath, TEST_REPORT: JSON.stringify(report([group([bucket()])])), TEST_DESCENDANT: path.join(directory, "descendant"), ...extraEnv }
   return {
     executable, env,
@@ -153,10 +181,15 @@ test("queries only the structured command in a private, restricted workspace and
   assert.equal(logs.length, 2)
   assert.equal(spawns.length, 2)
   for (const [index, actual] of spawns.entries()) {
-    assert.equal(actual.file, f.executable)
-    assert.deepEqual(actual.args, logs[index].args)
+    if (actual.file === "taskkill") continue
+    if (process.platform !== "win32") {
+      assert.equal(actual.file, f.executable)
+      assert.deepEqual(actual.args, logs[index].args)
+      assert.equal(actual.options.detached, true)
+    } else {
+      assert.equal(actual.options.detached, false)
+    }
     assert.equal(actual.options.windowsHide, true, "usage must hide both version and report child windows")
-    assert.equal(actual.options.detached, true)
     assert.deepEqual(actual.options.stdio, ["ignore", "pipe", "pipe"])
     assert.equal(path.basename(actual.options.cwd), path.basename(logs[index].cwd))
     assert.equal(actual.options.env.AGY_CLI_DISABLE_AUTO_UPDATE, "true")
@@ -168,35 +201,191 @@ test("queries only the structured command in a private, restricted workspace and
   assert.equal(logs[1].args[6], "--print-timeout")
   assert.match(logs[1].args[7], /^\d+s$/)
   for (const log of logs) {
-    assert.equal(log.mode, 0o700)
+    if (process.platform !== "win32") assert.equal(log.mode, 0o700)
     assert.equal(log.update, "true")
     assert.ok(log.agent.includes("tools: []\nmcpServers: []"))
     assert.equal(log.guard, 1)
     // macOS process.cwd() canonicalizes /var to /private/var.
     assert.equal(path.basename(log.path.split(path.delimiter)[0]), path.basename(log.cwd))
     assert.equal(path.dirname(log.browser), log.path.split(path.delimiter)[0])
-    assert.equal(path.basename(log.browser), "open")
+    assert.equal(path.basename(log.browser), process.platform === "win32" ? "open.cmd" : "open")
     await assert.rejects(fs.stat(log.cwd), { code: "ENOENT" })
   }
   assert.equal(f.env.AGY_CLI_DISABLE_AUTO_UPDATE, "false")
   await f.assertClean()
 })
 
-test("native Windows usage stays unsupported and never starts a CLI", async () => {
+test("simulated Windows fetches usage with hidden, attached children and a cmd browser guard", { skip: process.platform === "win32" }, async t => {
+  const f = await fixture(t, { PATH: "/usr/bin:/bin", Path: "C:\\Windows\\System32" })
   const descriptor = Object.getOwnPropertyDescriptor(process, "platform")
   const originalSpawn = childProcess.spawn
-  let calls = 0
+  const spawns = []
+  let taskkills = 0
+  let result
   try {
     Object.defineProperty(process, "platform", { ...descriptor, value: "win32" })
-    childProcess.spawn = () => { calls++; throw new Error("unexpected CLI launch") }
+    childProcess.spawn = (file, args, options) => {
+      if (file === "taskkill") {
+        taskkills++
+        return { unref() {} }
+      }
+      spawns.push({ file, args, options })
+      return originalSpawn(file, args, options)
+    }
     syncBuiltinESMExports()
-    await assert.rejects(fetchUsage("C:\\Program Files\\Antigravity\\agy.exe"), /currently require macOS or Linux/)
-    assert.equal(calls, 0)
+    result = await fetchUsage(f.executable, f.options)
   } finally {
     Object.defineProperty(process, "platform", descriptor)
     childProcess.spawn = originalSpawn
     syncBuiltinESMExports()
   }
+  assert.equal(result.windows[0].used, 25)
+  const logs = await f.logs()
+  assert.equal(logs.length, 2)
+  assert.equal(spawns.length, 2)
+  assert.equal(taskkills, 0, "a clean Windows run must never launch taskkill")
+  for (const [index, actual] of spawns.entries()) {
+    assert.equal(actual.file, f.executable)
+    assert.deepEqual(actual.args, logs[index].args)
+    assert.equal(path.basename(actual.options.cwd), path.basename(logs[index].cwd))
+    assert.equal(actual.options.detached, false, "Windows children stay attached to the runner")
+    assert.equal(actual.options.windowsHide, true)
+    assert.equal(actual.options.env.AGY_CLI_DISABLE_AUTO_UPDATE, "true")
+    assert.ok(!("Path" in actual.options.env), "mixed-case Path must be folded into PATH")
+    assert.equal(actual.options.env.PATH, actual.options.cwd + path.delimiter + "/usr/bin:/bin")
+  }
+  for (const log of logs) {
+    assert.equal(log.update, "true")
+    assert.equal(path.basename(path.dirname(log.browser)), path.basename(log.cwd))
+    assert.equal(path.basename(log.browser), "open.cmd")
+    assert.equal(log.browserContent, "@exit /b 1\r\n")
+    await assert.rejects(fs.stat(log.cwd), { code: "ENOENT" })
+  }
+  await f.assertClean()
+})
+
+test("simulated Windows timeouts kill the whole tree via taskkill /T /F /PID", { skip: process.platform === "win32" }, async t => {
+  const f = await fixture(t, { TEST_MODE: "hang" })
+  const descriptor = Object.getOwnPropertyDescriptor(process, "platform")
+  const originalSpawn = childProcess.spawn
+  const kills = []
+  try {
+    Object.defineProperty(process, "platform", { ...descriptor, value: "win32" })
+    childProcess.spawn = (file, args, options) => {
+      if (file === "taskkill") {
+        kills.push({ args, options })
+        // Emulate taskkill termination so the killed child releases its pipes on this POSIX host.
+        try { process.kill(Number(args[3]), "SIGKILL") } catch {}
+        return { unref() {} }
+      }
+      return originalSpawn(file, args, options)
+    }
+    syncBuiltinESMExports()
+    await assert.rejects(fetchUsage(f.executable, { ...f.options, timeoutMs: 600 }), /timed out/)
+  } finally {
+    Object.defineProperty(process, "platform", descriptor)
+    childProcess.spawn = originalSpawn
+    syncBuiltinESMExports()
+  }
+  const logs = await f.logs()
+  const treeKills = kills.filter(kill => kill.args[3] === String(logs[1].pid))
+  assert.equal(treeKills.length, 1)
+  assert.deepEqual(treeKills[0].args, ["/T", "/F", "/PID", String(logs[1].pid)])
+  assert.equal(treeKills[0].options.windowsHide, true)
+  // The runner must actually stop both children, not just stop waiting for them.
+  await new Promise(resolve => setTimeout(resolve, 20))
+  for (const log of logs) assert.throws(() => process.kill(log.pid, 0), { code: "ESRCH" })
+  await f.assertClean()
+})
+
+test("simulated Windows tree-kills pipe-holding descendants after the CLI parent exits", { skip: process.platform === "win32" }, async t => {
+  const f = await fixture(t, { TEST_MODE: "descendant" })
+  const descriptor = Object.getOwnPropertyDescriptor(process, "platform")
+  const originalSpawn = childProcess.spawn
+  const kills = []
+  let result
+  try {
+    Object.defineProperty(process, "platform", { ...descriptor, value: "win32" })
+    childProcess.spawn = (file, args, options) => {
+      if (file === "taskkill") {
+        kills.push({ args, options })
+        // Emulate /T tree termination so the inherited pipe closes on this POSIX host.
+        try { process.kill(Number(readFileSync(f.env.TEST_DESCENDANT, "utf8")), "SIGKILL") } catch {}
+        try { process.kill(Number(args[3]), "SIGKILL") } catch {}
+        return { unref() {} }
+      }
+      return originalSpawn(file, args, options)
+    }
+    syncBuiltinESMExports()
+    result = await fetchUsage(f.executable, f.options)
+  } finally {
+    Object.defineProperty(process, "platform", descriptor)
+    childProcess.spawn = originalSpawn
+    syncBuiltinESMExports()
+  }
+  assert.equal(result.windows[0].used, 25)
+  const logs = await f.logs()
+  const treeKills = kills.filter(kill => kill.args[3] === String(logs[1].pid))
+  assert.equal(treeKills.length, 1)
+  assert.deepEqual(treeKills[0].args, ["/T", "/F", "/PID", String(logs[1].pid)])
+  const pid = Number(await fs.readFile(f.env.TEST_DESCENDANT, "utf8"))
+  await new Promise(resolve => setTimeout(resolve, 50))
+  // A dead orphan can briefly be a zombie on Linux, which has no running code.
+  const status = spawnSync("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf8" })
+  assert.ok(!status.stdout.trim() || status.stdout.trim().startsWith("Z"))
+  await f.assertClean()
+})
+
+test("retries locked-directory removal (EBUSY) until it succeeds", async t => {
+  const f = await fixture(t)
+  const originalRm = fs.rm
+  const attempts = []
+  let result
+  try {
+    fs.rm = async (target, options) => {
+      attempts.push(target)
+      if (attempts.length <= 2) {
+        const error = new Error("EBUSY: directory is locked")
+        error.code = "EBUSY"
+        throw error
+      }
+      return originalRm(target, options)
+    }
+    syncBuiltinESMExports()
+    result = await fetchUsage(f.executable, f.options)
+  } finally {
+    fs.rm = originalRm
+    syncBuiltinESMExports()
+  }
+  assert.equal(result.windows[0].used, 25)
+  assert.equal(attempts.length, 3)
+  for (const target of attempts) assert.ok(path.basename(target).startsWith("magpie-agy-usage-"))
+  await f.assertClean()
+})
+
+test("stops retrying locked-directory removal after four attempts without failing the query", async t => {
+  const f = await fixture(t)
+  const originalRm = fs.rm
+  let attempts = 0
+  try {
+    fs.rm = async () => {
+      attempts++
+      const error = new Error("EBUSY: directory is locked")
+      error.code = "EBUSY"
+      throw error
+    }
+    syncBuiltinESMExports()
+    assert.equal((await fetchUsage(f.executable, f.options)).windows[0].used, 25)
+  } finally {
+    fs.rm = originalRm
+    syncBuiltinESMExports()
+  }
+  assert.equal(attempts, 4)
+  const root = path.dirname(f.env.TEST_LOG)
+  for (const name of (await fs.readdir(root)).filter(name => name.startsWith("magpie-agy-usage-"))) {
+    await fs.rm(path.join(root, name), { recursive: true, force: true })
+  }
+  await f.assertClean()
 })
 
 test("rejects old/unverified versions before any possible model prompt", async t => {
@@ -265,8 +454,7 @@ test("version/report hangs time out, terminate the process, and leave no workspa
     await assert.rejects(fetchUsage(f.executable, { ...f.options, timeoutMs: 600 }), /timed out/)
     // The runner must actually stop the child, not just stop waiting for it.
     for (const log of await f.logs()) {
-      await new Promise(resolve => setTimeout(resolve, 20))
-      assert.throws(() => process.kill(log.pid, 0), { code: "ESRCH" })
+      await waitForPidExit(log.pid)
     }
     await f.assertClean()
   }
@@ -290,10 +478,14 @@ test("terminates owned pipe-inheriting descendants even when the CLI parent alre
   const f = await fixture(t, { TEST_MODE: "descendant" })
   await fetchUsage(f.executable, f.options)
   const pid = Number(await fs.readFile(f.env.TEST_DESCENDANT, "utf8"))
-  await new Promise(resolve => setTimeout(resolve, 50))
-  // A dead orphan can briefly be a zombie on Linux, which has no running code.
-  const status = spawnSync("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf8" })
-  assert.ok(!status.stdout.trim() || status.stdout.trim().startsWith("Z"))
+  if (process.platform === "win32") {
+    await waitForPidExit(pid)
+  } else {
+    await new Promise(resolve => setTimeout(resolve, 50))
+    // A dead orphan can briefly be a zombie on Linux, which has no running code.
+    const status = spawnSync("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf8" })
+    assert.ok(!status.stdout.trim() || status.stdout.trim().startsWith("Z"))
+  }
   await f.assertClean()
 })
 
