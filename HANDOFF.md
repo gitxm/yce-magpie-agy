@@ -1,3 +1,15 @@
+## 2026-11-06：独立建仓为 magpie-agy v0.2.0
+
+- 包名改为 `magpie-agy`，版本 `0.2.0`，仓库 `github:gitxm/magpie-agy`
+  （https://github.com/gitxm/magpie-agy）。安装：`magpie plugin add github:gitxm/magpie-agy`。
+- **Magpie provider ID 仍是 `antigravity-bridge`**（不是 `magpie-agy`），所以路由组、
+  亲和性、登录态和会话停车文件（`magpie-agy-bridge/sessions.json`）直接沿用。
+- 默认进程池并发上限 8（`magpie.maxConcurrency` 同为 8），可用 `AGY_BRIDGE_MAX_PROCS`、
+  `AGY_BRIDGE_DETACHED_EVICT_MS`、`AGY_BRIDGE_MAX_PROMPT_BYTES` 调整。
+- 支持 macOS、Linux 与原生 Windows（含无弹窗后台更新屏蔽与 Windows 原生 `magpie quota`）。
+- 基线与逐项变更（上游主干、PR #8、本机补丁 A1–A16 / U1–U6）见 [NOTICE.md](NOTICE.md)。
+- 之前记录里的 `opencode-antigravity-bridge` 是旧包名与旧仓库，仅作历史描述。
+
 ## 2026-11-05：整合 PR #4 与 agy 1.5.0，维护者追加修复
 
 本段更新此前记录：输入 schema 现在做 Gemini/Vertex 兼容化处理（不是完整
@@ -20,7 +32,7 @@ schema 校验），用户图片通过协商后的 ACP image capability 发送；
   1.5.0：图片识别、原生 MCP 工具调用、跨进程 resume、思考等级变更通过；
   Flash 未输出思考摘要，不宣称本轮验证了思考文本。
 
-# Handoff: opencode-antigravity-bridge
+# Handoff: magpie-agy
 
 ## 2026-11-04：agy 1.5.0 图片输入和 ACP 配置选项
 
@@ -212,7 +224,7 @@ Anthropic Messages 桥接到真实的 `agy` CLI，而不是复用订阅凭据并
 Antigravity IDE 的 HTTP 身份。真实 CLI 可以避免客户端身份伪造，但不能承诺
 账号永远不会受到平台限制。
 
-仓库：https://github.com/DylanLIiii/opencode-antigravity-bridge
+仓库：https://github.com/gitxm/magpie-agy
 
 当前状态：**原生 MCP 工具透传已实现**。基线 commit 为 `292fb05`；本文描述
 其后的工作区修改，不表示这些修改已经提交或发布。
@@ -384,15 +396,16 @@ Chat 风格。现在 provider 和模型都补全 OpenCode 的 `api: {id, url, np
 ## 开发命令
 
 ```sh
-git clone https://github.com/DylanLIiii/opencode-antigravity-bridge
-cd opencode-antigravity-bridge
+git clone https://github.com/gitxm/magpie-agy
+cd magpie-agy
 node --check index.mjs
 node --check mcp-server.mjs
 node test-smoke.mjs
 npm pack --dry-run
 
 # 真实宿主验证（需要 magpie + 已登录 agy）
-magpie plugin add ./opencode-antigravity-bridge
+magpie plugin add github:gitxm/magpie-agy
+# 或本地目录：magpie plugin add ./magpie-agy
 ```
 
 ---

@@ -1,19 +1,26 @@
 {
-  "name": "@magpie-community/opencode-antigravity-bridge",
-  "version": "0.1.0",
+  "name": "magpie-agy",
+  "version": "0.2.0",
   "description": "Antigravity subscription provider that bridges to a real agy CLI over the Agent Client Protocol (agy acp), avoiding HTTP impersonation",
   "type": "module",
   "main": "./index.mjs",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/gitxm/magpie-agy.git"
+  },
+  "homepage": "https://github.com/gitxm/magpie-agy#readme",
   "files": [
     "index.mjs",
     "platform.mjs",
     "mcp-server.mjs",
     "usage.mjs",
     "README.md",
-    "README.en.md"
+    "README.en.md",
+    "LICENSE",
+    "NOTICE.md"
   ],
   "scripts": {
-    "test": "node --test test-usage.mjs test-compat.mjs test-platform.mjs && node test-smoke.mjs",
+    "test": "node --experimental-vm-modules --test test-usage.mjs test-compat.mjs test-platform.mjs test-catalog.mjs test-usage-settlement.mjs test-repeat-batch.mjs && node test-smoke.mjs",
     "test:integration": "node test-integration.mjs"
   },
   "keywords": [
@@ -28,7 +35,7 @@
   "license": "MIT",
   "magpie": {
     "icon": "https://raw.githubusercontent.com/yetone/magpie/v0.1.1356/internal/gui/assets/icons/antigravity-color.svg",
-    "maxConcurrency": 4
+    "maxConcurrency": 8
   },
   "engines": {
     "bun": ">=1.0.0"

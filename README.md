@@ -1,7 +1,11 @@
-# opencode-antigravity-bridge
+# magpie-agy
 
 把你的 **Antigravity 订阅**变成 OpenCode、Amp、Claude Code 等客户端的模型后端——
 Gemini、Claude、GPT-OSS 全系可用。
+
+> 包名是 `magpie-agy`（仓库 `github:gitxm/magpie-agy`），Magpie 里的 provider ID
+> 仍然是 `antigravity-bridge`，路由组和登录态直接沿用，不用重新配置。
+> 来源与变更清单见 [NOTICE.md](NOTICE.md)。
 
 **[English version → README.en.md](README.en.md)**
 
@@ -55,8 +59,10 @@ Prompt caching 由 Google 后端决定，本插件让请求前缀尽量稳定：
   登录过一次 Google 账号（实测版本 1.4.12 / 1.5.0）
 
 ```sh
-# 1. 安装插件（本地 checkout，尚未发布 npm）
-magpie plugin add ./opencode-antigravity-bridge
+# 1. 安装插件（直接从 GitHub 安装，provider ID 仍是 antigravity-bridge）
+magpie plugin add github:gitxm/magpie-agy
+# 或本地 checkout：
+# git clone https://github.com/gitxm/magpie-agy && magpie plugin add ./magpie-agy
 
 # 2. 交互式运行一次 agy 完成 Google 登录
 agy
@@ -109,8 +115,16 @@ magpie quota refresh antigravity-bridge --json
 
 - **图片**：只支持内联 base64（PNG/JPEG/GIF/WebP），不支持远程 URL 和二进制/PDF 文档；纯文本 document 和 search_result 可用。
   需要服务端声明 ACP 图片能力（agy 1.5.0 起）。
-- **平台**：Linux / macOS 已验证。Windows 已补充 `.exe` / `.cmd` / `.bat`
-  发现、启动和 WSL 路径处理，并有命令构造测试；维护者尚未完成 Windows 实机验证。
+- **平台**：支持 macOS、Linux 和原生 Windows。Windows 含 `.exe` / `.cmd` / `.bat`
+  发现与启动、WSL 路径处理、无弹窗的后台更新屏蔽（子进程一律
+  `AGY_CLI_DISABLE_AUTO_UPDATE=true` 且 `windowsHide`），以及 Windows 原生
+  `magpie quota`（含进程树清理、浏览器拦截、临时目录重试删除）。
+- **进程池并发**：默认最多同时 8 个 agy 进程（`package.json` 的
+  `magpie.maxConcurrency` 也是 8），可用 `AGY_BRIDGE_MAX_PROCS` 调整；池满时优先淘汰空闲进程，
+  其次淘汰客户端已断开超过 30 秒的挂起工具回合（`AGY_BRIDGE_DETACHED_EVICT_MS`），
+  不再因挂起回合占池而报 503。
+- **长历史重放预算**：重放提示词默认限制在 112 KiB 内（`AGY_BRIDGE_MAX_PROMPT_BYTES`），
+  保证 `</conversation_history>` 与当前回合不会被 agy 的 128 KiB 截断切掉。
 - **账号**：一个 Google 账号（agy 自己的登录态）；插件不会调用 ACP
   `authenticate` 去切换登录。
 - **会话状态文件**：`$XDG_STATE_HOME/magpie-agy-bridge/sessions.json`
@@ -124,4 +138,4 @@ magpie quota refresh antigravity-bridge --json
 
 ## License
 
-MIT
+MIT。版权与上游来源见 [LICENSE](LICENSE) 和 [NOTICE.md](NOTICE.md)。

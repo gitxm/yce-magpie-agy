@@ -1,6 +1,11 @@
-# opencode-antigravity-bridge
+# magpie-agy
 
 > 中文介绍见 [README.md](README.md)。
+
+> The package name is `magpie-agy` (repository `github:gitxm/magpie-agy`). The
+> Magpie provider ID is **still `antigravity-bridge`**, so existing routing
+> groups and sign-in state carry over unchanged. Provenance and the full change
+> list are in [NOTICE.md](NOTICE.md).
 
 A [magpie](https://github.com/yetone/magpie) provider plugin that serves an
 **Antigravity subscription through a real `agy` CLI process**, rather than
@@ -40,11 +45,21 @@ Google Code Assist backend
 
 ## Install
 
-From a local checkout (not yet published to npm):
+Directly from GitHub (the provider ID stays `antigravity-bridge`):
 
 ```sh
-magpie plugin add ./opencode-antigravity-bridge
+magpie plugin add github:gitxm/magpie-agy
 ```
+
+Or from a local checkout:
+
+```sh
+git clone https://github.com/gitxm/magpie-agy
+magpie plugin add ./magpie-agy
+```
+
+Supported platforms: macOS, Linux and native Windows (including the silent
+background-update guard and the native Windows `magpie quota`).
 
 ## Use
 
@@ -151,8 +166,15 @@ magpie plugin add ./opencode-antigravity-bridge
   `output_config.effort` / `thinking.budget_tokens`, Windows `.cmd` / `.bat` and
   WSL `/mnt/<drive>` working-directory translation, and legacy/small-fast model
   alias fallback.
-- **Conversation pooling**: at most four agy processes, idle reaping, LRU
-  eviction, and HTTP 503 for conflicting concurrent responses.
+- **Conversation pooling**: at most eight agy processes by default
+  (`AGY_BRIDGE_MAX_PROCS`; `magpie.maxConcurrency` is also 8), idle reaping, LRU
+  eviction, and HTTP 503 for conflicting concurrent responses. When the pool is
+  full and no idle process can be evicted, a suspended tool turn whose client
+  has been gone for more than 30 s (`AGY_BRIDGE_DETACHED_EVICT_MS`) is evicted
+  instead, and a later valid `tool_result` replays on a fresh process.
+- **Bounded replay prompt**: the initial replay prompt is kept within 112 KiB
+  (`AGY_BRIDGE_MAX_PROMPT_BYTES`) so the closing `</conversation_history>` and
+  the `<current_turn>` block never fall past agy's 128 KiB tail truncation.
 - **Isolation without a permission bypass.** The agent is defined with
   `tools: []`, `inheritMcp: false`, `inheritCustomizations: false` and
   `excludeDefaultComponents: true`, so the user's global MCP servers, skills and
@@ -282,8 +304,10 @@ before print mode because older slash-command implementations could treat
   not mark the bridge's sentinel login as revoked. Run `agy` interactively to
   repair an expired CLI sign-in.
 
-Quota probing currently supports **macOS and Linux**. Windows returns an
-explicit unsupported error rather than querying without browser/process guards.
+Quota probing supports **macOS, Linux and native Windows**. On Windows the query
+runs with `windowsHide`, kills the whole process tree with `taskkill /T /F`,
+intercepts browser launches through an `open.cmd` stub (`BROWSER`), de-duplicates
+`PATH`/`Path`, and retries temp-directory removal on `EBUSY`/`EPERM`/`ENOTEMPTY`.
 
 References: CodexBar's
 [CLI quota parser](https://github.com/steipete/CodexBar/blob/0aa34100b7a7ea397bcbf14eaab388d3f32aa4a1/Sources/CodexBarCore/Providers/Antigravity/AntigravityQuotaSummaryParser.swift)
@@ -346,6 +370,9 @@ The bridge uses the CLI path, not Magpie's remote OAuth implementation.
 | `AGY_BRIDGE_RESUME_TTL_MS` | 21600000 | how long a parked session can be resumed |
 | `AGY_BRIDGE_STATE_FILE` | `$XDG_STATE_HOME/magpie-agy-bridge/sessions.json` | where resumable sessions are recorded (hashes only) |
 | `AGY_BRIDGE_START_TIMEOUT_MS` / `_TURN_TIMEOUT_MS` / `_TOOL_TIMEOUT_MS` | 60 s / 5 min / 30 min | startup, agy inactivity, client tool result |
+| `AGY_BRIDGE_MAX_PROCS` | 8 | maximum number of concurrent agy processes in the pool |
+| `AGY_BRIDGE_DETACHED_EVICT_MS` | 30000 | how long a suspended tool turn whose client has disconnected may hold a pool slot before it can be evicted |
+| `AGY_BRIDGE_MAX_PROMPT_BYTES` | 114688 (112 KiB) | byte budget of the replayed initial prompt (keeps it below agy's 128 KiB truncation) |
 | `AGY_BRIDGE_MCP_TRACE` | unset | file that receives the MCP helper's traffic (diagnostics) |
 
 ## Development
@@ -464,4 +491,5 @@ text instead of only reporting a missing init event.
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE) for the copyright notices and
+[NOTICE.md](NOTICE.md) for upstream provenance.
