@@ -556,8 +556,20 @@ const legacyModel = "antigravity-bridge/gemini-test-low"
 }
 
 {
+  // models() serves a cached catalog and refreshes it in the background. Point
+  // AGY_PATH at a copy of the same wrapper so this probe always starts a real
+  // refresh, wait for it, then restore the original executable.
+  // Same directory and extension (.cmd on Windows), only a different name.
+  const probeWrapper = path.join(path.dirname(wrapper), "probe-" + path.basename(wrapper))
+  fs.copyFileSync(wrapper, probeWrapper)
+  fs.chmodSync(probeWrapper, 0o755)
+  process.env.AGY_PATH = probeWrapper
   const probesBefore = logs().filter(event => event.type === "models").length
-  const models = await plugin.provider.models()
+  let models = {}
+  for (let attempt = 0; attempt < 50 && !models["gemini-test"]; attempt++) {
+    if (attempt) await new Promise(resolve => setTimeout(resolve, 100))
+    models = await plugin.provider.models()
+  }
   const probes = logs().filter(event => event.type === "models").slice(probesBefore)
   check("directory refresh disables auto update even when the parent enables it", probes.length > 0 && probes.every(event => event.update === "true"))
   check("dynamic models accept tab-separated agy output", !!models["gemini-test"])
@@ -569,6 +581,12 @@ const legacyModel = "antigravity-bridge/gemini-test-low"
   check("grouped model declares Magpie and OpenCode reasoning", models["gemini-test"]?.capabilities?.reasoning === true && models["gemini-test"]?.reasoning === true)
   check("Gemini and Claude models expose image input to the host", models["gemini-test"]?.capabilities?.input?.image === true && models["claude-test-medium"]?.capabilities?.input?.image === true)
   check("single-effort models stay ungrouped", models["claude-test-medium"]?.name === "Claude Test (Medium)" && !models["claude-test-medium"]?.variants)
+  process.env.AGY_PATH = wrapper
+  // The original executable gets its own fresh catalog before later requests route on it.
+  for (let attempt = 0; attempt < 50 && !(await plugin.provider.models())["gemini-test"]; attempt++) {
+    await new Promise(resolve => setTimeout(resolve, 100))
+  }
+  try { fs.unlinkSync(probeWrapper) } catch {}
 }
 
 {
@@ -1272,13 +1290,23 @@ for (const location of ["inline", "system", "developer", "user"]) {
 }
 
 {
-  // Evict a live conversation through the four-process LRU, then continue it.
+  // Evict a live conversation through a four-process LRU, then continue it.
+  // The pool defaults to 8; pin 4 here and keep detached tool turns out of the
+  // second eviction level so only the idle-process LRU is exercised.
+  const savedMaxProcs = process.env.AGY_BRIDGE_MAX_PROCS
+  const savedDetachedEvict = process.env.AGY_BRIDGE_DETACHED_EVICT_MS
+  process.env.AGY_BRIDGE_MAX_PROCS = "4"
+  process.env.AGY_BRIDGE_DETACHED_EVICT_MS = "600000"
   const first = { model, messages: [{ role: "user", content: "MEMORY resume target" }] }
   const firstEvents = (await readSSE(await callFetch(first))).events
   const target = inits().at(-1)
   for (let index = 0; index < 4; index++) {
     await readSSE(await callFetch({ model, messages: [{ role: "user", content: `filler conversation ${index}` }] }))
   }
+  if (savedMaxProcs === undefined) delete process.env.AGY_BRIDGE_MAX_PROCS
+  else process.env.AGY_BRIDGE_MAX_PROCS = savedMaxProcs
+  if (savedDetachedEvict === undefined) delete process.env.AGY_BRIDGE_DETACHED_EVICT_MS
+  else process.env.AGY_BRIDGE_DETACHED_EVICT_MS = savedDetachedEvict
   check("LRU eviction stops the idle process", !fs.existsSync(target.cwd))
   const second = nextTurn(first, firstEvents, "MEMORY after eviction")
   const { events } = await readSSE(await callFetch(second))
