@@ -1,11 +1,12 @@
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
+import { execFileSync } from "node:child_process"
 
-const here = path.dirname(new URL(import.meta.url).pathname)
+const here = import.meta.dirname
 const suffix = `-${process.pid}`
 const fakeAgy = path.join(here, `.tmp-fake-agy${suffix}.mjs`)
-const wrapper = path.join(here, `.tmp-agy${suffix}`)
+const wrapper = path.join(here, `.tmp-agy${suffix}${process.platform === "win32" ? ".cmd" : ""}`)
 const logPath = path.join(here, `.tmp-fake-agy-log${suffix}`)
 const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "fake-agy-state-"))
 const originalAutoUpdate = process.env.AGY_CLI_DISABLE_AUTO_UPDATE
@@ -16,6 +17,24 @@ const bridgeStateFile = path.join(stateDir, "bridge-sessions.json")
 process.env.AGY_BRIDGE_STATE_FILE = bridgeStateFile
 process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS = "1000"
 process.env.AGY_BRIDGE_TURN_TIMEOUT_MS = "5000"
+
+// Windows has no POSIX mode bits (stat mirrors the owner bits into group and other),
+// so "private" is judged on the file ACL: no broad-group ACE may be present.
+function windowsAclPrivate(file) {
+  const broad = new Set(["everyone", "builtin\\users", "authenticated users", "nt authority\\authenticated users", "s-1-1-0", "s-1-5-11", "s-1-5-32-545"])
+  let out
+  try {
+    out = execFileSync("icacls.exe", [file], { encoding: "utf8", windowsHide: true })
+  } catch {
+    return false
+  }
+  const principals = out.split(/\r?\n/)
+    .map(line => line.trim())
+    .map(line => (line.startsWith(file) ? line.slice(file.length).trim() : line))
+    .filter(line => line.includes(":("))
+    .map(line => line.slice(0, line.indexOf(":(")).trim().toLowerCase())
+  return principals.length > 0 && !principals.some(name => broad.has(name))
+}
 
 // A fake `agy` that speaks ACP on stdio and reaches the client tools the way
 // the real one does: by running `nc 127.0.0.1 <--ide-mcp-port>` from PATH.
@@ -90,7 +109,8 @@ function connectIde() {
   if (!idePort) return Promise.resolve()
   if (mcpReady) return mcpReady
   mcpReady = (async () => {
-    mcp = spawn("nc", ["127.0.0.1", idePort], { stdio: ["pipe", "pipe", "pipe"] })
+    // Windows: nc is the nc.cmd shim from ensureShimDir; spawn() without a shell cannot run a .cmd file, so cmd.exe resolves it through PATHEXT
+    mcp = spawn("nc", ["127.0.0.1", idePort], { stdio: ["pipe", "pipe", "pipe"], shell: process.platform === "win32" })
     let error = ""
     mcp.stderr.on("data", data => { error += data })
     mcp.on("exit", code => { if (code) log({ type: "ncExit", code, error }) })
@@ -393,7 +413,11 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
 })
 `)
 
-fs.writeFileSync(wrapper, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(fakeAgy)} "$@"\n`)
+if (process.platform === "win32") {
+  fs.writeFileSync(wrapper, `@"${process.execPath}" "${fakeAgy}" %*\r\n`)
+} else {
+  fs.writeFileSync(wrapper, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(fakeAgy)} "$@"\n`)
+}
 fs.chmodSync(wrapper, 0o755)
 process.env.AGY_PATH = wrapper
 
@@ -1323,7 +1347,7 @@ for (const location of ["inline", "system", "developer", "user"]) {
   const stored = fs.readFileSync(bridgeStateFile, "utf8")
   check("session state is written after a completed turn", stored.includes(target.convId))
   check("session state stores hashes, not conversation text", !stored.includes("MEMORY before restart") && !stored.includes("RESTART-SYSTEM-MARKER"))
-  check("session state file is private", (fs.statSync(bridgeStateFile).mode & 0o077) === 0)
+  check("session state file is private", process.platform === "win32" ? windowsAclPrivate(bridgeStateFile) : (fs.statSync(bridgeStateFile).mode & 0o077) === 0)
   const { default: restartedDefault } = await import("./index.mjs?restart")
   const restarted = await restartedDefault.server({ client: null, directory: os.tmpdir() }, {})
   const restartedLoader = await restarted.auth.loader(async () => ({ key: "agy" }))
