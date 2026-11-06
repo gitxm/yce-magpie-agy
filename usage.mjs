@@ -89,6 +89,41 @@ export function parseUsageReport(value) {
   return { windows }
 }
 
+// Magpie's public `used` field is a percentage (0..100); the policy threshold
+// is a fraction. Keep the display contract, including unknown quotas, intact.
+export function exhaustedWindows(report, { threshold = 0.98 } = {}) {
+  return (report?.windows || []).filter(window => Number.isFinite(window.used) &&
+    window.used >= 0 && window.used <= 100 && window.used / 100 >= threshold)
+}
+
+// Display-only masking for the auto-switch quota view: the local part keeps
+// its first letter, the domain keeps its first letter and public suffix, and
+// every other character becomes `***` (`alice@googlemail.com` → `a***@g***.com`).
+// A full address must never reach the host; non-addresses mask to "".
+export function maskEmail(email) {
+  const value = String(email ?? "")
+  const at = value.indexOf("@")
+  if (at <= 0 || at === value.length - 1 || /\s/.test(value)) return ""
+  const local = value.slice(0, at)
+  const domain = value.slice(at + 1)
+  const suffix = domain.slice(domain.lastIndexOf("."))
+  return `${local.slice(0, 1)}***@${domain.slice(0, 1)}***${domain.includes(".") ? suffix : ""}`
+}
+
+// Prefix every window name with the masked current account while the host's
+// auto_switch switch is on, so the quota view shows which account is serving.
+// The address comes from the plugin's verified token file, never from /usage
+// output. Pure display: the input report is not mutated, and cooldown
+// bookkeeping keeps reading the raw pool names, not these badges.
+export function maskedAccountReport(report, email) {
+  const badge = maskEmail(email)
+  if (!badge) return report
+  return {
+    ...report,
+    windows: (report?.windows || []).map(window => ({ ...window, name: `${badge} · ${window.name}` })),
+  }
+}
+
 function timeout(value) {
   const n = Number(value)
   return Number.isFinite(n) && n > 0 ? Math.min(n, MAX_TIMEOUT_MS) : DEFAULT_TIMEOUT_MS
@@ -274,18 +309,44 @@ export async function fetchUsage(agy, {
 // No completed-result cache: sequential refreshes must see account/allowance changes.
 export function createUsageReader(resolveAgy, options = {}) {
   const pending = new Map()
-  return async () => {
+  const { waitForGate = async () => {}, isGateClosed = () => false, getGeneration = () => 0, ...fetchOptions } = options
+  let revision = 0
+  const read = async () => {
     try {
-      const agy = resolveAgy()
-      if (!pending.has(agy)) {
-        const query = fetchUsage(agy, options).finally(() => {
-          if (pending.get(agy) === query) pending.delete(agy)
-        })
-        pending.set(agy, query)
+      for (;;) {
+        await waitForGate()
+        if (isGateClosed()) continue
+        const generation = getGeneration()
+        const started = revision
+        const agy = resolveAgy()
+        const key = JSON.stringify([agy, generation, started])
+        if (!pending.has(key)) {
+          const controller = new AbortController()
+          const signal = fetchOptions.signal
+            ? AbortSignal.any([controller.signal, fetchOptions.signal]) : controller.signal
+          const query = fetchUsage(agy, { ...fetchOptions, signal }).finally(() => {
+            if (pending.get(key)?.query === query) pending.delete(key)
+          })
+          pending.set(key, { query, controller })
+        }
+        try {
+          const result = await pending.get(key).query
+          if (revision !== started || getGeneration() !== generation) continue
+          return { ...structuredClone(result), signIn: "kept" }
+        } catch (error) {
+          if (revision !== started || getGeneration() !== generation) continue
+          throw error
+        }
       }
-      return { ...structuredClone(await pending.get(agy)), signIn: "kept" }
     } catch (error) {
-      return { windows: [], error: error instanceof UsageError ? error.message : "agy usage query failed. Check the CLI and temporary-directory permissions.", signIn: "kept" }
+      return { windows: [], error: error instanceof UsageError || error?.statusCode === 503 ? error.message : "agy usage query failed. Check the CLI and temporary-directory permissions.", signIn: "kept" }
     }
   }
+  read.invalidate = async () => {
+    revision++
+    const old = [...pending.values()]
+    for (const entry of old) entry.controller.abort()
+    await Promise.allSettled(old.map(entry => entry.query))
+  }
+  return read
 }

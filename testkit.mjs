@@ -23,6 +23,7 @@ import { EventEmitter } from "node:events"
 import { spawnSync } from "node:child_process"
 import { createRequire } from "node:module"
 import { fileURLToPath, pathToFileURL } from "node:url"
+import { captureCurrent, defaultVaultDir, tokenFileOf, accountsFileOf } from "./accounts.mjs"
 
 const require = createRequire(import.meta.url)
 
@@ -31,6 +32,7 @@ export const REPO_DIR = path.dirname(fileURLToPath(import.meta.url))
 export const INDEX_FILE = process.env.AGY_BRIDGE_TEST_INDEX || path.join(REPO_DIR, "index.mjs")
 export const USAGE_FILE = path.join(REPO_DIR, "usage.mjs")
 export const PLATFORM_FILE = path.join(REPO_DIR, "platform.mjs")
+export const ACCOUNTS_FILE = path.join(REPO_DIR, "accounts.mjs")
 export const MESSAGES_URL = "agy://local/v1/messages"
 export const COUNT_TOKENS_URL = "agy://local/v1/messages/count_tokens"
 export const CATALOG_TTL_MS = 5 * 60 * 1000
@@ -40,8 +42,29 @@ const RUNTIME_NAMES = ["Date", "setTimeout", "clearTimeout", "setInterval", "cle
 const RUNTIME_PRELUDE = `import { ${RUNTIME_NAMES.join(", ")} } from ${JSON.stringify(RUNTIME_SPECIFIER)};\n`
 const TEST_EXPORTS = "\nexport { Turn as __agyTestTurn, allProcs as __agyTestAllProcs, pool as __agyTestPool, " +
   "execOnce as __agyTestExecOnce, findAgy as __agyTestFindAgy, canonicalBody as __agyTestCanonicalBody, " +
-  "conversationKey as __agyTestConversationKey, renderInitialPromptParts as __agyTestRenderInitialPromptParts };\n"
+  "conversationKey as __agyTestConversationKey, renderInitialPromptParts as __agyTestRenderInitialPromptParts, " +
+  "scheduleAccountSwitch as __agyTestScheduleAccountSwitch };\n"
 const IDENTIFIER_RE = /^[A-Za-z_$][\w$]*$/
+
+// Synthetic credentials only. Never defaults to the developer's home.
+export function seedAccountHome(home, { emails = ["first@example.test", "second@example.test"],
+  env = {}, capture = true } = {}) {
+  if (!home || path.resolve(home) === path.resolve(os.homedir())) throw new Error("fixture requires a temporary home")
+  const vaultDir = defaultVaultDir({ home, env })
+  const tokenFile = tokenFileOf(home)
+  const accountsFile = accountsFileOf(home)
+  fs.mkdirSync(path.dirname(tokenFile), { recursive: true })
+  const token = email => ({ auth_method: "oauth", id_token_email: email,
+    token: { refresh_token: `synthetic-fixture-${emails.indexOf(email)}` } })
+  if (capture) for (const email of emails) {
+    fs.writeFileSync(tokenFile, JSON.stringify(token(email)))
+    const result = captureCurrent({ home, vaultDir })
+    if (!result.ok) throw new Error(result.reason)
+  }
+  fs.writeFileSync(tokenFile, JSON.stringify(token(emails[0])))
+  fs.writeFileSync(accountsFile, JSON.stringify({ active: emails[0], old: emails.slice(1) }))
+  return { home, emails, vaultDir, tokenFile, accountsFile }
+}
 
 if (typeof vm.SourceTextModule !== "function" || typeof vm.SyntheticModule !== "function") {
   // Keep the documented plain `node test_*.mjs` entry point usable too.
@@ -235,6 +258,8 @@ class FakeAgy {
   onMessage(message) {
     const { id, method, params } = message
     this.kit.acpLog.push({ method, params, sessionId: this.sessionId })
+    // Optional QA protocol boundary; absent in all existing fixtures.
+    if (this.kit.qaAcp?.(message, this) === true) return
     if (method === "initialize") {
       this.respond(id, { protocolVersion: 1, agentInfo: { name: "fake-agy", version: "0.0.0-test" }, agentCapabilities: {} })
     } else if (method === "session/new") {
@@ -422,6 +447,8 @@ export async function createBridgeKit(options = {}) {
     },
   })
   const spawn = (file, args = [], opts = {}) => {
+    const scripted = kit.qaSpawn?.(file, args, opts, () => new FakeChild(kit, file, args))
+    if (scripted) return scripted
     if (args[0] === "models") return spawnModels(kit, file, args)
     if (args[0] === "acp") {
       const child = new FakeChild(kit, file, args)
@@ -450,6 +477,12 @@ export async function createBridgeKit(options = {}) {
       },
     },
     "node:os": { homedir: () => home, tmpdir: () => tmp },
+    "node:fs": { readFileSync(file, ...args) {
+      if (kit.qaReadFile) return kit.qaReadFile(file, args, () =>
+        file === "/proc/version" ? "Linux test host" : fs.readFileSync(file, ...args))
+      if (file === "/proc/version") return "Linux test host"
+      return fs.readFileSync(file, ...args)
+    } },
   }
   const runtime = new vm.SyntheticModule(RUNTIME_NAMES, function init() {
     this.setExport("Date", clock.Date)
@@ -471,6 +504,7 @@ export async function createBridgeKit(options = {}) {
     let module
     if (key === "./usage.mjs") module = sourceModule(USAGE_FILE, "", usageUrl)
     else if (key === "./platform.mjs") module = sourceModule(PLATFORM_FILE, "", platformUrl)
+    else if (key === "./accounts.mjs") module = sourceModule(ACCOUNTS_FILE, "", pathToFileURL(ACCOUNTS_FILE).href)
     else if (key.startsWith("node:")) module = builtinModule(key, overrides[key])
     else throw new Error(`testkit: 未登记的依赖 ${specifier}`)
     cache.set(key, module)

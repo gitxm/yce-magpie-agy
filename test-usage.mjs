@@ -1,16 +1,55 @@
 import assert from "node:assert/strict"
 import childProcess, { spawnSync } from "node:child_process"
-import { readFileSync } from "node:fs"
+import fsSync, { readFileSync } from "node:fs"
 import { syncBuiltinESMExports } from "node:module"
 import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { test } from "node:test"
-import { createUsageReader, fetchUsage, parseUsageReport } from "./usage.mjs"
+import { accountsFileOf, tokenFileOf } from "./accounts.mjs"
+import { createUsageReader, exhaustedWindows, fetchUsage, maskEmail, maskedAccountReport, parseUsageReport } from "./usage.mjs"
 
 const report = groups => ({ status: "SUCCESS", command: { name: "usage", data: { groups } } })
 const group = (buckets, name = "Gemini Models") => ({ name, buckets })
 const bucket = (overrides = {}) => ({ id: "gemini-5h", name: "Five Hour Limit Remaining", window: "5h", remaining_fraction: 0.75, ...overrides })
+
+test("exhaustedWindows uses the 98% boundary without changing public percentage units", () => {
+  const parsed = parseUsageReport(report([group([0.020001, 0.02, 0, 0.75].map((remaining_fraction, i) =>
+    bucket({ id: `quota-${i}`, remaining_fraction, reset_time: "2027-01-01T00:00:00Z" })))]))
+  const before = structuredClone(parsed)
+  assert.deepEqual(exhaustedWindows(parsed).map(w => w.used), [98, 100])
+  assert.equal(exhaustedWindows(parsed)[0].resetsAt, "2027-01-01T00:00:00.000Z")
+  assert.equal(exhaustedWindows(parsed, { threshold: 0.25 }).length, 4)
+  assert.deepEqual(parsed, before)
+})
+
+test("exhaustedWindows ignores unknown, invalid and missing measurements", () => {
+  assert.deepEqual(exhaustedWindows({ windows: [undefined, null, "98", NaN, Infinity, -1, 101].map(used => ({ used })) }), [])
+  assert.deepEqual(exhaustedWindows({ windows: [{ name: "unknown" }] }), [])
+  assert.deepEqual(exhaustedWindows(null), [])
+})
+
+test("maskEmail keeps only the first letters and the public suffix", () => {
+  assert.equal(maskEmail("alice@googlemail.com"), "a***@g***.com")
+  assert.equal(maskEmail("bruce@example.org"), "b***@e***.org")
+  assert.equal(maskEmail("a@b.co"), "a***@b***.co")
+  assert.equal(maskEmail("x@y.z.w"), "x***@y***.w")
+  assert.equal(maskEmail("someone@localhost"), "s***@l***")
+  for (const value of ["", " ", "no-at-sign", "@start", "end@", "a b@c.de", null, undefined, 42]) {
+    assert.equal(maskEmail(value), "")
+  }
+})
+
+test("maskedAccountReport prefixes window names without leaking the address", () => {
+  const parsed = parseUsageReport(report([group([bucket(), bucket({ id: "gemini-weekly", window: "weekly", remaining_fraction: 0.5 })])]))
+  const before = structuredClone(parsed)
+  const masked = maskedAccountReport(parsed, "alice@googlemail.com")
+  assert.deepEqual(masked.windows.map(w => w.name), ["a***@g***.com · Gemini · 5 hours", "a***@g***.com · Gemini · 7 days"])
+  assert.deepEqual(masked.windows.map(w => w.used), [25, 50])
+  assert.deepEqual(parsed, before, "masking must not mutate the caller's report")
+  assert.doesNotMatch(JSON.stringify(masked), /alice|googlemail/i)
+  assert.equal(maskedAccountReport(parsed, "not-an-email").windows[0].name, "Gemini · 5 hours")
+})
 
 test("maps all groups/cadences to display-only Magpie windows, without invented identity", () => {
   const result = parseUsageReport(report([
@@ -415,6 +454,45 @@ test("only concurrent refreshes share work, and callers cannot mutate each other
   await f.assertClean()
 })
 
+test("usage waits for the account gate before launching even its version probe", async t => {
+  const f = await fixture(t)
+  let open
+  const gate = new Promise(resolve => { open = resolve })
+  const read = createUsageReader(() => f.executable, { ...f.options, waitForGate: () => gate })
+  const result = read()
+  await new Promise(resolve => setTimeout(resolve, 30))
+  await assert.rejects(fs.readFile(f.env.TEST_LOG), { code: "ENOENT" })
+  open()
+  assert.equal((await result).windows[0].used, 25)
+  await f.assertClean()
+})
+
+test("invalidated in-flight usage is discarded and concurrent waiters get the new account", async t => {
+  const f = await fixture(t, { TEST_MODE: "delay" })
+  let gate = Promise.resolve()
+  let generation = 0
+  const read = createUsageReader(() => f.executable, { ...f.options,
+    waitForGate: () => gate, getGeneration: () => generation })
+  const first = read()
+  for (let i = 0; i < 100; i++) {
+    let calls = []
+    try { calls = await f.logs() } catch {}
+    if (calls.some(call => call.args.includes("/usage"))) break
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  let open
+  gate = new Promise(resolve => { open = resolve })
+  await read.invalidate()
+  const second = read()
+  generation++
+  f.env.TEST_REPORT = JSON.stringify(report([group([bucket({ remaining_fraction: 0.6 })])]))
+  open()
+  const results = await Promise.all([first, second])
+  assert.deepEqual(results.map(r => r.windows[0].used), [40, 40])
+  assert.equal((await f.logs()).filter(call => call.args.includes("/usage")).length, 2)
+  await f.assertClean()
+})
+
 test("reports sanitized failures and preserves the bridge sign-in; failures are retryable", async t => {
   for (const [message, expected] of [
     ["Not logged in secret@example.com https://secret.invalid/token", /sign in again/],
@@ -501,4 +579,72 @@ test("missing executables and filesystem failures do not leak local paths", asyn
   const result = await createUsageReader(() => f.executable, { ...f.options, tempRoot: f.executable })()
   assert.ok(result.error)
   assert.doesNotMatch(result.error, /agy-usage-test-/)
+})
+
+test("auth.usage shows the masked current account only while auto_switch is on", async t => {
+  const f = await fixture(t)
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), "agy-usage-mask-"))
+  t.after(async () => { for (let i = 0; i < 6; i++) { try { await fs.rm(home, { recursive: true, force: true }); break } catch { await new Promise(r => setTimeout(r, 50)) } } })
+  const emails = ["alice@googlemail.com", "bruce@example.org"]
+  const tokenPayload = email => ({ auth_method: "oauth", id_token_email: email, token: { refresh_token: "synthetic" } })
+  const seed = email => {
+    fsSync.mkdirSync(path.dirname(tokenFileOf(home)), { recursive: true })
+    fsSync.writeFileSync(tokenFileOf(home), JSON.stringify(tokenPayload(email)))
+    fsSync.writeFileSync(accountsFileOf(home), JSON.stringify({ active: email, old: emails.filter(other => other !== email) }))
+  }
+  const envKeys = ["HOME", "USERPROFILE", "XDG_STATE_HOME", "AGY_PATH", "WSL_DISTRO_NAME", "TEST_LOG", "TEST_REPORT", "TEST_MODE", "TEST_VERSION"]
+  const savedEnv = Object.fromEntries(envKeys.map(key => [key, process.env[key]]))
+  const realReadFileSync = fsSync.readFileSync
+  // Force a non-WSL host verdict wherever the suite itself runs.
+  fsSync.readFileSync = function (file, ...args) {
+    if (file === "/proc/version") return "Linux usage-mask test host"
+    return realReadFileSync.call(this, file, ...args)
+  }
+  syncBuiltinESMExports()
+  const restore = () => {
+    for (const [key, value] of Object.entries(savedEnv)) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+    fsSync.readFileSync = realReadFileSync
+    syncBuiltinESMExports()
+  }
+  try {
+    seed(emails[0])
+    process.env.HOME = home
+    process.env.USERPROFILE = home
+    process.env.XDG_STATE_HOME = path.join(home, "state")
+    process.env.AGY_PATH = f.executable
+    delete process.env.WSL_DISTRO_NAME
+    process.env.TEST_LOG = f.env.TEST_LOG
+    process.env.TEST_REPORT = f.env.TEST_REPORT
+    delete process.env.TEST_MODE
+    delete process.env.TEST_VERSION
+    const on = await (await import("./index.mjs?usage-mask-on")).AntigravityBridgePlugin(
+      { magpie: { option: (_id, key) => key === "auto_switch" ? true : undefined } })
+
+    const masked = await on.auth.usage()
+    assert.equal(masked.windows[0].name, "a***@g***.com · Gemini · 5 hours")
+    assert.equal(masked.error, undefined)
+    assert.ok(!JSON.stringify(masked).includes(emails[0]), "the full address must never reach the host")
+
+    seed(emails[1])
+    const switched = await on.auth.usage()
+    assert.equal(switched.windows[0].name, "b***@e***.org · Gemini · 5 hours")
+    assert.ok(!JSON.stringify(switched).includes(emails[1]))
+
+    // Token file wins over google_accounts.json; the disagreement is reported.
+    fsSync.writeFileSync(tokenFileOf(home), JSON.stringify(tokenPayload(emails[0])))
+    const mismatched = await on.auth.usage()
+    assert.equal(mismatched.windows[0].name, "a***@g***.com · Gemini · 5 hours")
+    assert.match(mismatched.error || "", /两处账号文件不一致/)
+
+    const off = await (await import("./index.mjs?usage-mask-off")).AntigravityBridgePlugin()
+    const plain = await off.auth.usage()
+    assert.deepEqual(plain.windows.map(w => w.name), ["Gemini · 5 hours"], "switch off keeps the pre-change names verbatim")
+    assert.ok(plain.windows.every(w => !w.name.includes("@")))
+    assert.equal(plain.error, undefined)
+  } finally {
+    restore()
+  }
 })

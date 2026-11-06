@@ -1,14 +1,21 @@
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { execFileSync } from "node:child_process"
+import { execFileSync, spawn } from "node:child_process"
+import { Socket } from "node:net"
+import { seedAccountHome, createBridgeKit } from "./testkit.mjs"
+import { accountKey, acquireSwitchLock } from "./accounts.mjs"
 
 const here = import.meta.dirname
 const suffix = `-${process.pid}`
 const fakeAgy = path.join(here, `.tmp-fake-agy${suffix}.mjs`)
 const wrapper = path.join(here, `.tmp-agy${suffix}${process.platform === "win32" ? ".cmd" : ""}`)
-const logPath = path.join(here, `.tmp-fake-agy-log${suffix}`)
 const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "fake-agy-state-"))
+// The fixture log is appended by the fake-agy child and read back right after
+// each turn. DrvFs/9p appends are not atomic to a concurrent reader (torn or
+// briefly missing trailing lines), so keep the log on the local tmp filesystem
+// next to the state dir instead of beside the sources.
+const logPath = path.join(stateDir, `fake-agy-log${suffix}`)
 const originalAutoUpdate = process.env.AGY_CLI_DISABLE_AUTO_UPDATE
 process.env.AGY_CLI_DISABLE_AUTO_UPDATE = "false"
 process.env.FAKE_AGY_LOG = logPath
@@ -54,7 +61,8 @@ if (argv.includes("--version")) {
 }
 if (argv.includes("/usage")) {
   log({ type: "usage", cwd: process.cwd(), args: argv })
-  send({ status: "SUCCESS", command: { name: "usage", data: { groups: [{
+  if (process.env.FAKE_AGY_USAGE_DELAY) await new Promise(resolve => setTimeout(resolve, Number(process.env.FAKE_AGY_USAGE_DELAY)))
+  send(process.env.FAKE_AGY_USAGE_REPORT ? JSON.parse(process.env.FAKE_AGY_USAGE_REPORT) : { status: "SUCCESS", command: { name: "usage", data: { groups: [{
     name: "Gemini Models", buckets: [{ id: "gemini-weekly", window: "weekly", remaining_fraction: 0.6, reset_time: "2026-10-27T00:00:00Z" }],
   }] } } })
   process.exit(0)
@@ -197,6 +205,17 @@ async function prompt(params) {
     fs.appendFileSync(agentLog, "E1103 17:11:25.570096 685 errorreport.go:224] agent executor error: generating and executing: RESOURCE_EXHAUSTED (code 429): quota exhausted.\n")
     chunk("\n⚠ Agent execution ")
     chunk("terminated due to error.\n")
+    return { stopReason: "end_turn" }
+  }
+  if (text.includes("CAPACITY") || text.includes("RATE_ONLY")) {
+    fs.appendFileSync(agentLog, "E1103 17:11:25.570096 685 errorreport.go:224] agent executor error: generating and executing: " +
+      (text.includes("CAPACITY") ? "MODEL_CAPACITY_EXHAUSTED (code 429)" : "code 429") + ": unavailable.\n")
+    chunk("\n⚠ Agent execution terminated due to error.\n")
+    return { stopReason: "end_turn" }
+  }
+  if (text.includes("AUTH_EXPIRED")) {
+    fs.appendFileSync(agentLog, "E1103 17:11:25.570096 685 errorreport.go:224] agent executor error: generating and executing: UNAUTHENTICATED: refresh token expired.\n")
+    chunk("\n⚠ Agent execution terminated due to error.\n")
     return { stopReason: "end_turn" }
   }
   if (text.includes("PERMISSION")) {
@@ -637,6 +656,12 @@ async function launchedModel(body) {
   check("single-effort model requests pass through unchanged", await launchedModel({ model: "yce-magpie-agy/claude-test-medium", thinking: { type: "enabled", budget_tokens: 4096 }, messages: [{ role: "user", content: "MODEL singleton" }] }) === "claude-test-medium")
   check("modern sessions select models and levels through ACP config options", logs().some(event => event.type === "setConfig" && event.configId === "model") && logs().some(event => event.type === "setConfig" && event.configId === "thought_level" && event.value === "low"))
   check("modern model selection does not call legacy set_model", !logs().some(event => event.type === "setModel"), JSON.stringify(logs().filter(event => event.type === "setModel")))
+}
+
+{
+  process.env.AGY_BRIDGE_EFFORT = "low"
+  check("AGY_BRIDGE_EFFORT no longer forces a level", await launchedModel({ model, messages: [{ role: "user", content: "MODEL env effort removed" }] }) === "gemini-test-high")
+  delete process.env.AGY_BRIDGE_EFFORT
 }
 
 {
@@ -2244,6 +2269,237 @@ for (const location of ["inline", "system", "developer", "user"]) {
     process.stderr.write = write
     delete process.env.AGY_BRIDGE_IDE_CALL_DEADLINE_MS
   }
+}
+
+{
+  // Real fake-ACP processes and real locks, with every credential/state path in
+  // temporary homes. Simulate a plain Linux host only for these Linux fixtures;
+  // the WSL case below explicitly restores the disabling signal.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "agy-switch-smoke-"))
+  const cases = Object.fromEntries(["off", "switch", "lock", "foreign", "cool", "usage", "wsl", "legacy"].map(name => {
+    const home = path.join(root, name)
+    const env = { AGY_BRIDGE_STATE_FILE: path.join(home, "state", "sessions.json") }
+    return [name, { ...seedAccountHome(home, { env, capture: !["off", "wsl"].includes(name) }), env }]
+  }))
+  const envKeys = ["HOME", "USERPROFILE", "XDG_STATE_HOME", "AGY_BRIDGE_STATE_FILE", "WSL_DISTRO_NAME", "FAKE_AGY_USAGE_REPORT", "FAKE_AGY_USAGE_DELAY"]
+  const savedEnv = Object.fromEntries(envKeys.map(key => [key, process.env[key]]))
+  const homedir = os.homedir
+  const readFile = fs.readFileSync
+  const readdir = fs.readdirSync
+  const stderrWrite = process.stderr.write
+  const socketEnd = Socket.prototype.end
+  const events = []
+  const closedCalls = []
+  let external = null
+  let externalLock = null
+  let fixture
+  let switchedPlugin
+  let switchedLoader
+  let serial = 0
+  const pause = ms => new Promise(resolve => setTimeout(resolve, ms))
+  const waitFor = async predicate => {
+    for (let i = 0; i < 200; i++) {
+      if (predicate()) return true
+      await pause(20)
+    }
+    return false
+  }
+  const active = () => JSON.parse(fs.readFileSync(fixture.accountsFile, "utf8")).active
+  const send = body => switchedLoader.fetch("agy://local/messages", { method: "POST", body: JSON.stringify(body) })
+  const quota = async label => {
+    const response = await send({ model, stream: false, metadata: { user_id: `quota-${++serial}` },
+      messages: [{ role: "user", content: `QUOTA exhausted ${label}` }] })
+    const payload = await response.json()
+    check(`${label}: client keeps 429 rate_limit_error`, response.status === 429 && payload.error?.type === "rate_limit_error")
+  }
+  const use = async (name, enabled = true) => {
+    fixture = cases[name]
+    os.homedir = () => fixture.home
+    process.env.HOME = fixture.home
+    process.env.USERPROFILE = fixture.home
+    process.env.XDG_STATE_HOME = path.join(fixture.home, "state")
+    process.env.AGY_BRIDGE_STATE_FILE = fixture.env.AGY_BRIDGE_STATE_FILE
+    delete process.env.WSL_DISTRO_NAME
+    delete process.env.FAKE_AGY_USAGE_REPORT
+    delete process.env.FAKE_AGY_USAGE_DELAY
+    const mod = await import(`./index.mjs?account-switch-smoke-${++serial}`)
+    switchedPlugin = await mod.default.server({ magpie: { option: (_id, key) => key === "auto_switch" ? enabled : undefined } }, { maxProcs: 2 })
+    switchedLoader = await switchedPlugin.auth.loader()
+    events.length = 0
+  }
+  fs.readFileSync = function(file, ...args) {
+    if (file === "/proc/version") return "Linux fixture host"
+    return readFile.call(this, file, ...args)
+  }
+  fs.readdirSync = function(file, ...args) {
+    // No unrelated host processes may make the fixture nondeterministic.
+    if (file === "/proc") return external ? [String(external.pid)] : []
+    return readdir.call(this, file, ...args)
+  }
+  process.stderr.write = function(chunk, ...args) {
+    if (String(chunk).startsWith("[agy-bridge] ")) events.push(JSON.parse(String(chunk).slice(13)))
+    return stderrWrite.call(this, chunk, ...args)
+  }
+  Socket.prototype.end = function(chunk, ...args) {
+    if (typeof chunk === "string" && chunk.includes("plugin switched agy accounts")) closedCalls.push(chunk)
+    return socketEnd.call(this, chunk, ...args)
+  }
+  try {
+    await use("off", false)
+    const before = [fixture.tokenFile, fixture.accountsFile].map(file => fs.readFileSync(file, "utf8"))
+    await quota("switch off")
+    await pause(50)
+    check("switch off leaves account files byte-for-byte unchanged", [fixture.tokenFile, fixture.accountsFile].every((file, i) => fs.readFileSync(file, "utf8") === before[i]))
+    check("switch off never creates the account vault or switch lock", !fs.existsSync(fixture.vaultDir) && !fs.existsSync(path.join(fixture.home, ".better-harness")))
+
+    await use("switch")
+    for (const marker of ["CAPACITY", "RATE_ONLY"]) {
+      const response = await send({ model, stream: false, messages: [{ role: "user", content: marker }] })
+      check(`${marker} keeps the client rate limit response`, response.status === 429 && (await response.json()).error.type === "rate_limit_error")
+      await pause(30)
+      check(`${marker} does not switch or record account exhaustion`, active() === fixture.emails[0] && !fs.existsSync(path.join(fixture.vaultDir, "cooldown.json")))
+    }
+    const memory = { model, messages: [{ role: "user", content: "MEMORY account-bound parking" }] }
+    const memoryEvents = (await readSSE(await send(memory))).events
+    const firstSession = inits().at(-1).convId
+    const follow = nextTurn(memory, memoryEvents, "MEMORY continue after switching")
+    const tool = { model, tools: [echoTool], metadata: { user_id: "account-switch-pending-tool" }, messages: [{ role: "user", content: "TOOL pending during switch" }] }
+    const toolEvents = (await readSSE(await send(tool))).events
+    const usageBefore = logs().filter(row => row.type === "usage").length
+    const promptsBefore = logs().filter(row => row.type === "user").length
+    await quota("two captured accounts")
+    check("quota error switches google_accounts active to the second account", await waitFor(() => active() === fixture.emails[1]))
+    check("quota error swaps the token too and puts the first account in old", JSON.parse(fs.readFileSync(fixture.tokenFile, "utf8")).id_token_email === fixture.emails[1] && JSON.parse(fs.readFileSync(fixture.accountsFile, "utf8")).old.includes(fixture.emails[0]))
+    check("quota failure is never automatically replayed or polled for usage", logs().filter(row => row.type === "user").length === promptsBefore + 1 && logs().filter(row => row.type === "usage").length === usageBefore)
+    check("pending tool receives ACCOUNT_SWITCH_NOTE", closedCalls.some(line => line.includes("agy bridge: this tool call was closed because the plugin switched agy accounts; stop this turn")))
+    const replay = (await readSSE(await send(follow))).events
+    check("different account starts session/new and replays full history", !inits().at(-1).resumed && lastOf("user").text.includes("MEMORY account-bound parking") && stopOf(replay) === "end_turn")
+    let toolFollow = continuation(tool, toolEvents, "result after account switch")
+    let replayTools = (await readSSE(await send(toolFollow))).events
+    check("reclaimed tool conversation replays its supplied result successfully", !inits().at(-1).resumed && lastOf("user").text.includes("result after account switch"))
+    for (let i = 0; i < 6 && stopOf(replayTools) === "tool_use"; i++) {
+      toolFollow = continuation(toolFollow, replayTools, "cleanup")
+      replayTools = (await readSSE(await send(toolFollow))).events
+    }
+    fs.writeFileSync(path.join(fixture.vaultDir, "cooldown.json"), "{}")
+    await quota("return to original account")
+    check("second quota rotates back to the original account", await waitFor(() => active() === fixture.emails[0]))
+    await readSSE(await send(follow))
+    check("returning within TTL resumes the original account's parked session", inits().at(-1).resumed && inits().at(-1).convId === firstSession)
+    check("switch events disclose only masked email addresses", events.filter(row => row.action === "account_switch").every(row => !JSON.stringify(row).includes(fixture.emails[0]) && !JSON.stringify(row).includes(fixture.emails[1])))
+
+    await use("lock")
+    externalLock = await acquireSwitchLock({ home: fixture.home })
+    check("external lock fixture acquired the real switch lock", externalLock.ok)
+    await quota("external lock")
+    check("external switch lock prevents mutation and is logged", await waitFor(() => events.some(row => row.status === "另一切号进行中")) && active() === fixture.emails[0])
+    await externalLock.release()
+    externalLock = null
+
+    await use("foreign")
+    if (process.platform === "linux") {
+      const executable = path.join(fixture.home, "agy")
+      fs.writeFileSync(executable, "setInterval(() => {}, 1000)\n")
+      external = spawn(process.execPath, [executable], { stdio: "ignore", windowsHide: true })
+      await pause(30)
+      await quota("external agy")
+      check("an external fake agy blocks switching and is logged", await waitFor(() => events.some(row => /在途/.test(row.status))) && active() === fixture.emails[0])
+      external.kill()
+      await new Promise(resolve => external.once("close", resolve))
+      external = null
+    }
+
+    await use("cool")
+    const reset = Date.now() + 2 * 60 * 60 * 1000
+    fs.writeFileSync(path.join(fixture.vaultDir, "cooldown.json"), JSON.stringify({ [accountKey(fixture.emails[1])]: { gemini: reset } }))
+    await quota("all accounts cooling")
+    await waitFor(() => events.some(row => /最早恢复时间/.test(row.status)))
+    const cooling = await switchedPlugin.auth.usage()
+    check("all cooled accounts stay put and usage reports the earliest recovery", active() === fixture.emails[0] && /所有账号额度用尽，最早恢复时间 \d{4}-/.test(cooling.error || ""))
+
+    await use("usage")
+    const resetsAt = new Date(Date.now() + 30 * 60 * 1000).toISOString()
+    process.env.FAKE_AGY_USAGE_REPORT = JSON.stringify({ status: "SUCCESS", command: { name: "usage", data: { groups: [
+      { name: "Gemini Models", buckets: [{ id: "weekly", window: "weekly", remaining_fraction: 0.02, reset_time: resetsAt }] },
+      { name: "Claude and GPT models", buckets: [{ id: "weekly", window: "weekly", remaining_fraction: 0.5 }] },
+    ] } } })
+    await switchedPlugin.auth.usage()
+    const cooldown = JSON.parse(fs.readFileSync(path.join(fixture.vaultDir, "cooldown.json"), "utf8"))[accountKey(fixture.emails[0])]
+    check("98% usage records that model group's reset without switching", active() === fixture.emails[0] && cooldown.gemini === Date.parse(resetsAt) && cooldown.claude === undefined)
+    await quota("authentication fixture switches first")
+    await waitFor(() => active() === fixture.emails[1])
+    const authError = await send({ model, stream: false, messages: [{ role: "user", content: "AUTH_EXPIRED" }] })
+    await authError.text()
+    await waitFor(() => events.some(row => row.reason === "authentication_error"))
+    const authCooldown = JSON.parse(fs.readFileSync(path.join(fixture.vaultDir, "cooldown.json"), "utf8"))[accountKey(fixture.emails[1])]
+    check("expired target credentials are cooled for an hour without another switch", authError.status === 502 && active() === fixture.emails[1] && authCooldown?.["gemini-test"] > Date.now() + 3_500_000)
+    check("expired credentials show the re-login requirement in usage", /需重新登录/.test((await switchedPlugin.auth.usage()).error || ""))
+
+    await use("wsl")
+    process.env.WSL_DISTRO_NAME = "Fixture-WSL"
+    await quota("WSL host")
+    await pause(50)
+    const wslUsage = await switchedPlugin.auth.usage()
+    check("WSL prevents switching, vault creation and reports the exact host guidance", active() === fixture.emails[0] && !fs.existsSync(fixture.vaultDir) && wslUsage.error === "插件运行在 WSL：本机 agy 启动包装每次都会按 Windows 侧账号覆盖 WSL 账号；请在 Windows 宿主上开启自动切号")
+
+    await use("legacy", false)
+    const legacy = { model, messages: [{ role: "user", content: "MEMORY legacy without account" }] }
+    const legacyEvents = (await readSSE(await send(legacy))).events
+    const legacySession = inits().at(-1).convId
+    const legacyState = JSON.parse(fs.readFileSync(fixture.env.AGY_BRIDGE_STATE_FILE, "utf8"))
+    check("legacy fixture remains version 1 without account tags", legacyState.version === 1 && legacyState.entries.some(entry => entry.sessionId === legacySession && !entry.account))
+    legacyState.entries.push({ ...legacyState.entries[0], key: "legacy-untouched", sessionId: "legacy-untouched" })
+    fs.writeFileSync(fixture.env.AGY_BRIDGE_STATE_FILE, JSON.stringify(legacyState))
+    await use("legacy")
+    await readSSE(await send(nextTurn(legacy, legacyEvents, "MEMORY resume legacy")))
+    check("old-format sessions resume on first load before any plugin switch", inits().at(-1).resumed && inits().at(-1).convId === legacySession)
+    await quota("legacy migration")
+    await waitFor(() => active() === fixture.emails[1])
+    const migrated = JSON.parse(fs.readFileSync(fixture.env.AGY_BRIDGE_STATE_FILE, "utf8"))
+    check("first switch keeps version 1 and tags old entries with the source account", migrated.version === 1 && migrated.accountSwitchOccurred && migrated.entries.some(entry => entry.sessionId === "legacy-untouched") && migrated.entries.every(entry => entry.account === accountKey(fixture.emails[0])))
+  } finally {
+    await externalLock?.release?.()
+    external?.kill()
+    os.homedir = homedir
+    fs.readFileSync = readFile
+    fs.readdirSync = readdir
+    process.stderr.write = stderrWrite
+    Socket.prototype.end = socketEnd
+    for (const [key, value] of Object.entries(savedEnv)) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+}
+
+{
+  // The wall clock controls the 120s drain budget; a shortened gate timer makes
+  // its HTTP 503 path testable without keeping the suite asleep for two minutes.
+  const kit = await createBridgeKit({ indexTransform: source => source.replace(
+    "const ACCOUNT_SWITCH_TIMEOUT_MS = 120_000", "const ACCOUNT_SWITCH_TIMEOUT_MS = 80") })
+  let finish
+  const held = new Promise(resolve => { finish = resolve })
+  try {
+    const seeded = seedAccountHome(kit.home, { env: kit.env })
+    await kit.module.AntigravityBridgePlugin({ magpie: { option: (_id, key) => key === "auto_switch" ? true : undefined } })
+    kit.defaultPrompt = async agent => { await agent.text("still streaming"); await held; await agent.text("finished naturally") }
+    const response = await kit.request({ model: "gemini-3.8-flash", messages: [{ role: "user", content: "held stream" }] })
+    const body = readSSE(response)
+    await new Promise(resolve => setTimeout(resolve, 10))
+    const proc = [...kit.module.__agyTestAllProcs][0]
+    const switching = kit.module.__agyTestScheduleAccountSwitch({ reason: "quota_error", modelFamily: "gemini-3.8-flash" })
+    check("concurrent switch triggers share one operation", switching === kit.module.__agyTestScheduleAccountSwitch({ reason: "quota_error", modelFamily: "gemini-3.8-flash" }))
+    const blocked = await kit.request({ model: "gemini-3.8-flash", messages: [{ role: "user", content: "waiting at gate" }] })
+    check("account gate has a bounded HTTP 503 instead of starting a process", blocked.status === 503 && /account switch/.test(await blocked.text()) && kit.acpSpawns.length === 1)
+    kit.clock.advance(120_001)
+    await switching
+    check("drain timeout leaves the live streaming process and account intact", !proc.dead && !proc.stopping && proc.turn && JSON.parse(fs.readFileSync(seeded.accountsFile, "utf8")).active === seeded.emails[0])
+    finish()
+    check("timed-out switch lets the original stream finish naturally", textOf((await body).events).includes("finished naturally"))
+    const next = await kit.request({ model: "gemini-3.8-flash", messages: [{ role: "user", content: "gate reopened" }] })
+    check("drain timeout reopens admission for the next request", next.status === 200 && textOf((await readSSE(next)).events).includes("finished naturally"))
+  } finally { finish(); await kit.dispose() }
 }
 
 check("all ACP children disable auto update despite the parent false value", inits().length > 0 && inits().every(event => event.update === "true"))
