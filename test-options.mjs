@@ -178,9 +178,22 @@ test("auth.options 声明三个开关且符合 Magpie 约束", async () => {
       assert.equal(typeof option.description, "string")
       assert.ok(option.description.length > 0 && option.description.length <= 300)
       assert.equal(typeof option.default, "boolean")
+      assert.ok(option.labels && typeof option.labels === "object" && !Array.isArray(option.labels))
+      assert.ok(option.descriptions && typeof option.descriptions === "object" && !Array.isArray(option.descriptions))
+      for (const lang of ["zh", "zh-TW"]) {
+        assert.equal(typeof option.labels[lang], "string")
+        assert.ok(option.labels[lang].length > 0 && option.labels[lang].length <= 60)
+        assert.equal(typeof option.descriptions[lang], "string")
+        assert.ok(option.descriptions[lang].length > 0 && option.descriptions[lang].length <= 300)
+      }
       if ("confirm" in option) {
         assert.equal(typeof option.confirm, "string")
         assert.ok(option.confirm.length > 0 && option.confirm.length <= 300)
+        assert.ok(option.confirms && typeof option.confirms === "object" && !Array.isArray(option.confirms))
+        for (const lang of ["zh", "zh-TW"]) {
+          assert.equal(typeof option.confirms[lang], "string")
+          assert.ok(option.confirms[lang].length > 0 && option.confirms[lang].length <= 300)
+        }
       }
     }
     const auto = options.find((option) => option.key === "auto_switch")

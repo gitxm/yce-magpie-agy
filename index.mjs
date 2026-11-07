@@ -4329,12 +4329,28 @@ export const AntigravityBridgePlugin = async (input, packageOptions) => {
           label: "Thinking summaries",
           description: "Forward agy thought summaries as thinking blocks. Off: responses carry no thinking text (same as AGY_BRIDGE_THINKING=0).",
           default: true,
+          labels: {
+            zh: "转发思考摘要",
+            "zh-TW": "轉發思考摘要",
+          },
+          descriptions: {
+            zh: "开启后，把 agy 输出的思考摘要作为 thinking 块返回给客户端。关闭后回复不带思考文本（等同于设置 AGY_BRIDGE_THINKING=0），改完下一条请求立即生效。",
+            "zh-TW": "開啟後，將 agy 輸出的思考摘要作為 thinking 區塊回傳給用戶端。關閉後回覆不帶思考文字（等同於設定 AGY_BRIDGE_THINKING=0），修改後下一筆請求立即生效。",
+          },
         },
         {
           key: "minimal_agent",
           label: "Minimal isolated agent",
           description: "Run agy with a minimal isolated agent. Off: agy's default prompt components are kept, costing about 2,600 more input tokens on every model call. Applies to newly started agy processes.",
           default: true,
+          labels: {
+            zh: "精简隔离代理",
+            "zh-TW": "精簡隔離代理",
+          },
+          descriptions: {
+            zh: "开启后，用精简隔离模式启动 agy，去掉其自带的默认提示词组件。关闭后会保留默认提示词，每次模型调用大约多花 2,600 个输入 token；切换后下一次请求自动换新进程生效。",
+            "zh-TW": "開啟後，以精簡隔離模式啟動 agy，去除其內建的預設提示詞組件。關閉後會保留預設提示詞，每次模型呼叫約多耗用 2,600 個輸入 token；切換後下一次請求自動換新行程生效。",
+          },
         },
         {
           key: "auto_switch",
@@ -4342,6 +4358,18 @@ export const AntigravityBridgePlugin = async (input, packageOptions) => {
           description: "When the current agy account runs out of quota, stop this plugin's agy processes and switch to the next account from plugin Options → accounts. Rewrites the agy account files under ~/.gemini; skipped while other agy work is running.",
           default: false,
           confirm: "Auto-switch rewrites ~/.gemini/google_accounts.json and the agy OAuth token file. Do not run another account switcher at the same time. Enable?",
+          labels: {
+            zh: "多账号自动切号",
+            "zh-TW": "多帳號自動切換",
+          },
+          descriptions: {
+            zh: "开启后，当前 agy 账号额度用尽时自动停掉本插件启动的 agy 进程，按插件 Options → accounts 顺序切到下一个已备份账号（改写 ~/.gemini 下的账号文件）；外部有其他 agy 正在运行时跳过，WSL 宿主下不生效。",
+            "zh-TW": "開啟後，目前 agy 帳號額度用盡時自動停掉本外掛啟動的 agy 行程，依外掛 Options → accounts 順序切換至下一個已備份帳號（改寫 ~/.gemini 下的帳號檔案）；外部有其他 agy 正在執行時略過，WSL 宿主下不生效。",
+          },
+          confirms: {
+            zh: "开启自动切号会改写 ~/.gemini/google_accounts.json 和 agy 的 OAuth 令牌文件。开启期间请不要同时运行其他切号工具。确定开启吗？",
+            "zh-TW": "開啟自動切換會改寫 ~/.gemini/google_accounts.json 與 agy 的 OAuth 權杖檔案。開啟期間請勿同時執行其他切號工具。確定開啟嗎？",
+          },
         },
       ],
       // Magpie's usage hook; OpenCode ignores this extension. agy owns auth.
