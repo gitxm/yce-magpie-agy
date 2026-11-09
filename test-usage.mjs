@@ -1,6 +1,7 @@
 import assert from "node:assert/strict"
 import childProcess, { spawnSync } from "node:child_process"
 import fsSync, { readFileSync } from "node:fs"
+import { EventEmitter } from "node:events"
 import { syncBuiltinESMExports } from "node:module"
 import fs from "node:fs/promises"
 import os from "node:os"
@@ -117,7 +118,7 @@ test("requires a successful usage command with at least one enabled measured buc
   }
 })
 
-async function waitForPidExit(pid, timeoutMs = 1000) {
+async function waitForPidExit(pid, timeoutMs = process.platform === "win32" ? 5000 : 1000) {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     try {
@@ -133,12 +134,7 @@ async function waitForPidExit(pid, timeoutMs = 1000) {
 async function fixture(t, extraEnv = {}) {
   const isWin = process.platform === "win32"
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "agy-usage-test-"))
-  t.after(async () => {
-    for (let i = 0; i < 6; i++) {
-      try { await fs.rm(directory, { recursive: true, force: true }); break }
-      catch { await new Promise(r => setTimeout(r, 50)) }
-    }
-  })
+  t.after(() => fs.rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }))
   const script = path.join(directory, "fake.mjs")
   const executable = path.join(directory, isWin ? "agy.cmd" : "agy")
   const logPath = path.join(directory, "calls.jsonl")
@@ -193,8 +189,20 @@ else if (version) {
   const env = { ...process.env, TEST_LOG: logPath, TEST_REPORT: JSON.stringify(report([group([bucket()])])), TEST_DESCENDANT: path.join(directory, "descendant"), ...extraEnv }
   return {
     executable, env,
-    options: { env, tempRoot: directory },
+    // Native cmd -> node -> cmd cold starts can exceed the production probe
+    // budget under a parallel test run. Keep both phases inside the total cap.
+    options: { env, tempRoot: directory, ...(isWin ? { timeoutMs: 18_000, versionTimeoutMs: 8000 } : {}) },
     async logs() { return (await fs.readFile(logPath, "utf8")).trim().split("\n").map(line => JSON.parse(line)) },
+    async waitForReport() {
+      const deadline = Date.now() + 10_000
+      while (Date.now() < deadline) {
+        let rows = []
+        try { rows = await this.logs() } catch (error) { if (error.code !== "ENOENT") throw error }
+        if (rows.some(row => row.args.includes("/usage"))) return
+        await new Promise(resolve => setTimeout(resolve, 25))
+      }
+      assert.fail("fixture report process did not start")
+    },
     async assertClean() { assert.deepEqual((await fs.readdir(directory)).filter(name => name.startsWith("magpie-agy-usage-")), []) },
   }
 }
@@ -307,23 +315,37 @@ test("simulated Windows timeouts kill the whole tree via taskkill /T /F /PID", {
   const f = await fixture(t, { TEST_MODE: "hang" })
   const descriptor = Object.getOwnPropertyDescriptor(process, "platform")
   const originalSpawn = childProcess.spawn
+  const originalRm = fs.rm
   const kills = []
+  let killCompleted = false
+  let earlyRemovals = 0
   try {
     Object.defineProperty(process, "platform", { ...descriptor, value: "win32" })
     childProcess.spawn = (file, args, options) => {
       if (file === "taskkill") {
         kills.push({ args, options })
-        // Emulate taskkill termination so the killed child releases its pipes on this POSIX host.
-        try { process.kill(Number(args[3]), "SIGKILL") } catch {}
-        return { unref() {} }
+        // Delay termination to expose removal racing taskkill completion.
+        const killer = new EventEmitter()
+        killer.unref = () => {}
+        setTimeout(() => {
+          try { process.kill(Number(args[3]), "SIGKILL") } catch {}
+          killCompleted = true
+          killer.emit("close", 0)
+        }, 150)
+        return killer
       }
       return originalSpawn(file, args, options)
+    }
+    fs.rm = async (target, options) => {
+      if (!killCompleted) earlyRemovals++
+      return originalRm(target, options)
     }
     syncBuiltinESMExports()
     await assert.rejects(fetchUsage(f.executable, { ...f.options, timeoutMs: 600 }), /timed out/)
   } finally {
     Object.defineProperty(process, "platform", descriptor)
     childProcess.spawn = originalSpawn
+    fs.rm = originalRm
     syncBuiltinESMExports()
   }
   const logs = await f.logs()
@@ -331,6 +353,7 @@ test("simulated Windows timeouts kill the whole tree via taskkill /T /F /PID", {
   assert.equal(treeKills.length, 1)
   assert.deepEqual(treeKills[0].args, ["/T", "/F", "/PID", String(logs[1].pid)])
   assert.equal(treeKills[0].options.windowsHide, true)
+  assert.equal(earlyRemovals, 0, "workspace removal must wait for taskkill")
   // The runner must actually stop both children, not just stop waiting for them.
   await new Promise(resolve => setTimeout(resolve, 20))
   for (const log of logs) assert.throws(() => process.kill(log.pid, 0), { code: "ESRCH" })
@@ -402,7 +425,7 @@ test("retries locked-directory removal (EBUSY) until it succeeds", async t => {
   await f.assertClean()
 })
 
-test("stops retrying locked-directory removal after four attempts without failing the query", async t => {
+test("stops retrying locked-directory removal after eight attempts without failing the query", async t => {
   const f = await fixture(t)
   const originalRm = fs.rm
   let attempts = 0
@@ -419,7 +442,7 @@ test("stops retrying locked-directory removal after four attempts without failin
     fs.rm = originalRm
     syncBuiltinESMExports()
   }
-  assert.equal(attempts, 4)
+  assert.equal(attempts, 8)
   const root = path.dirname(f.env.TEST_LOG)
   for (const name of (await fs.readdir(root)).filter(name => name.startsWith("magpie-agy-usage-"))) {
     await fs.rm(path.join(root, name), { recursive: true, force: true })
@@ -529,9 +552,13 @@ test("invalid and oversized stdout/stderr reports fail within the output budget"
 test("version/report hangs time out, terminate the process, and leave no workspace", async t => {
   for (const mode of ["version-hang", "hang"]) {
     const f = await fixture(t, { TEST_MODE: mode })
-    await assert.rejects(fetchUsage(f.executable, { ...f.options, timeoutMs: 600 }), /timed out/)
+    // Native Windows starts cmd -> node -> cmd for the browser guard.
+    // Give those cold starts enough time to reach the intended hang.
+    await assert.rejects(fetchUsage(f.executable, { ...f.options, timeoutMs: process.platform === "win32" ? 10_000 : 600 }), /timed out/)
     // The runner must actually stop the child, not just stop waiting for it.
-    for (const log of await f.logs()) {
+    const logs = await f.logs()
+    assert.equal(logs.length, mode === "version-hang" ? 1 : 2)
+    for (const log of logs) {
       await waitForPidExit(log.pid)
     }
     await f.assertClean()
@@ -541,10 +568,17 @@ test("version/report hangs time out, terminate the process, and leave no workspa
 test("cancellation stops a running report and cleans its private workspace", async t => {
   const f = await fixture(t, { TEST_MODE: "hang" })
   const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), 600)
+  const query = fetchUsage(f.executable, { ...f.options, signal: controller.signal })
+  query.catch(() => {})
   try {
-    await assert.rejects(fetchUsage(f.executable, { ...f.options, signal: controller.signal }), /cancelled/)
-  } finally { clearTimeout(timer) }
+    await f.waitForReport()
+    controller.abort()
+    await assert.rejects(query, /cancelled/)
+  } finally {
+    controller.abort()
+    await query.catch(() => {})
+  }
+  for (const log of await f.logs()) await waitForPidExit(log.pid)
   await f.assertClean()
   const alreadyAborted = new AbortController()
   alreadyAborted.abort()

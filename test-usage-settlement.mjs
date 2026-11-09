@@ -6,18 +6,24 @@
 // 全部经真实仓内 index.mjs 的 fetch → Proc → ACP → 流生成/消费路径，假 agy 见 testkit.mjs。
 // 口径（主控已拍板）：单步精确透传；多步为有界估算，原始 ACP 累计对象原样保留，
 // 不承诺各响应 usage 求和精确等于上游累计（下面专门有数值反例）。
+// ACP 排他口径：inputTokens 只含未缓存输入，与 cachedReadTokens / cachedWriteTokens 互不包含；
+// outputTokens 已含 thoughtTokens。
 
 import { test } from "node:test"
 import assert from "node:assert/strict"
 import {
-  baseBody, continueWithToolResults, createBridgeKit, padBodyToTokens, readJson, readSse, sleep,
+  acpUsage, baseBody, continueWithToolResults, createBridgeKit, padBodyToTokens, readJson, readSse, sleep,
   usageTotal,
 } from "./testkit.mjs"
 
 const FIXTURE_ESTIMATE = 198_654
+// 全部命中读缓存：未缓存输入为 0，输入侧三桶之和 = 4,775,934；输出 60,000 已含思考 1,234。
+const FIXTURE_PROMPT = 4_775_934
 const FIXTURE_RAW = Object.freeze({
-  inputTokens: 4_775_934, cachedReadTokens: 4_775_934, cachedWriteTokens: 0, outputTokens: 60_000, thoughtTokens: 1_234,
+  inputTokens: 0, cachedReadTokens: FIXTURE_PROMPT, cachedWriteTokens: 0, outputTokens: 61_234, thoughtTokens: 1_234,
+  totalTokens: FIXTURE_PROMPT + 61_234,
 })
+const ZERO_USAGE = { input_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 0 }
 
 async function withKit(options, fn) {
   const kit = await createBridgeKit(options)
@@ -62,9 +68,10 @@ async function runTurn(kit, body, { stream = true, resultFor } = {}) {
 
 // ----------------------------------------------------------------------------- 单步
 
-test("单步回合精确透传 ACP usage 并原样保留原始对象", async () => {
+test("单步回合按排他口径原样透传三桶、输出不重复加思考，并原样保留原始对象", async () => {
   await withKit({}, async (kit) => {
-    const raw = { inputTokens: 1000, cachedReadTokens: 400, cachedWriteTokens: 50, outputTokens: 30, thoughtTokens: 5 }
+    // agy 1.5.2 usageFromModelUsageStats 回放向量：(I=1000,R=400,W=50,O=30,T=5,total=1480)。
+    const raw = { inputTokens: 1000, cachedReadTokens: 400, cachedWriteTokens: 50, outputTokens: 30, thoughtTokens: 5, totalTokens: 1480 }
     kit.prompts.push(async (agent) => {
       await agent.thought("considering")
       await agent.text("single step answer")
@@ -73,20 +80,38 @@ test("单步回合精确透传 ACP usage 并原样保留原始对象", async () 
     const { responses } = await runTurn(kit, baseBody())
     assert.equal(responses.length, 1)
     assert.deepEqual(plain(responses[0].usage), {
-      input_tokens: 600, output_tokens: 35, cache_read_input_tokens: 400, cache_creation_input_tokens: 50,
+      input_tokens: 1000, output_tokens: 30, cache_read_input_tokens: 400, cache_creation_input_tokens: 50,
       output_tokens_details: { thinking_tokens: 5 },
     })
     const start = responses[0].events.find((item) => item.event === "message_start")
-    // 上下文下限移植（fix ③）后 message_start 带请求体的非零估算输入，不再是全 0：
-    // 断言 output 为 0、输入为正且落在同一估算基数的有界范围内。
-    const startUsage = plain(start.data.message.usage)
-    assert.equal(startUsage.output_tokens, 0)
-    assert.ok(startUsage.input_tokens + startUsage.cache_read_input_tokens + startUsage.cache_creation_input_tokens >= 1,
-      `message_start 输入估算应为非零，实际 ${JSON.stringify(startUsage)}`)
+    // message_start 不再预填估算：四字段全 0，最终数只在 message_delta。
+    assert.deepEqual(plain(start.data.message.usage), ZERO_USAGE)
     const [turn] = kit.turns
+    assert.equal(turn.responseSteps[0].usageKind, "exact")
     assert.deepEqual(plain(turn.rawUsage), raw)
     assert.equal(turn.rawAcpUsages.length, 1)
   })
+})
+
+test("全缓存与读量大于未缓存输入时三桶不互减，O 小于 T 时按 T 兜底", async () => {
+  const cases = [
+    [acpUsage({ input: 0, read: 50_000, output: 15, thought: 5 }),
+      { input_tokens: 0, cache_read_input_tokens: 50_000, cache_creation_input_tokens: 0, output_tokens: 20, output_tokens_details: { thinking_tokens: 5 } }],
+    [acpUsage({ input: 300, read: 9_000, write: 20, output: 10 }),
+      { input_tokens: 300, cache_read_input_tokens: 9_000, cache_creation_input_tokens: 20, output_tokens: 10 }],
+    [{ inputTokens: 500, cachedReadTokens: 100, outputTokens: 3, thoughtTokens: 9 },
+      { input_tokens: 500, cache_read_input_tokens: 100, cache_creation_input_tokens: 0, output_tokens: 9, output_tokens_details: { thinking_tokens: 9 } }],
+  ]
+  for (const [raw, expected] of cases) {
+    await withKit({}, async (kit) => {
+      kit.prompts.push(async (agent) => {
+        await agent.text("cached answer")
+        return { stopReason: "end_turn", usage: raw }
+      })
+      const { responses } = await runTurn(kit, baseBody({ tools: [] }))
+      assert.deepEqual(plain(responses[0].usage), expected, JSON.stringify(raw))
+    })
+  }
 })
 
 // ------------------------------------------------------------------ 25 步固定案例
@@ -130,10 +155,17 @@ test("25 步/74 工具/累计 4,775,934：各步窗口有界、原始累计保�
     assert.equal(final.stopReason, "end_turn")
     assertCleanUsage(final.usage, "收尾响应")
     const finalTotal = usageTotal(final.usage)
-    assert.notEqual(finalTotal, FIXTURE_RAW.inputTokens, "收尾响应仍在吐整轮累计（4.8m 跳变）")
-    assert.ok(finalTotal <= Math.round(estimates[24] * 1.5), `收尾 ${finalTotal} 超过 1.5 倍估算 ${estimates[24]}`)
+    assert.notEqual(finalTotal, FIXTURE_PROMPT, "收尾响应仍在吐整轮累计（4.8m 跳变）")
+    assert.ok(finalTotal <= Math.round(estimates[24] * 1.5), `收尾三桶之和 ${finalTotal} 超过 1.5 倍估算 ${estimates[24]}`)
     assert.ok(finalTotal > 150_000 && finalTotal < 300_000, `收尾窗口 ${finalTotal} 不在约 198k 的量级`)
-    assert.ok(final.usage.cache_read_input_tokens >= finalTotal - 1, "本轮全部命中读缓存，拆分应保持该占比")
+    assert.ok(final.usage.cache_read_input_tokens > 0, "全缓存回合的收尾读量被抹成 0（旧包含口径 min(I,R) 缺陷）")
+    assert.equal(final.usage.cache_read_input_tokens, finalTotal, "本轮全部命中读缓存，拆分应保持该占比")
+    assert.equal(final.usage.input_tokens, 0)
+    assert.equal(kit.turns[0].responseSteps.at(-1).usageKind, "bounded_step_estimate")
+    // 末步 = round(I+R+W × E_last/ΣE)，且不超过 round(1.5 × E_last)。
+    const sumE = kit.turns[0].stepInputEstimates.reduce((sum, value) => sum + value, 0)
+    const lastE = kit.turns[0].stepInputEstimates.at(-1)
+    assert.equal(finalTotal, Math.min(Math.round(FIXTURE_PROMPT * lastE / Math.max(lastE, sumE)), Math.round(1.5 * lastE)))
     assert.ok(final.usage.output_tokens >= 1)
 
     // 原始 ACP 累计对象原样保留、只计一次。
@@ -145,16 +177,16 @@ test("25 步/74 工具/累计 4,775,934：各步窗口有界、原始累计保�
     // 守恒反例：一般多步估算的求和不等于上游累计，也不能把残差塞回末步。
     const fixtureSum24 = 24 * FIXTURE_ESTIMATE
     assert.equal(fixtureSum24, 4_767_696)
-    const fixtureLast = Math.round(FIXTURE_RAW.inputTokens / 25)
+    const fixtureLast = Math.round(FIXTURE_PROMPT / 25)
     assert.equal(fixtureLast, 191_037)
-    assert.notEqual(fixtureSum24 + fixtureLast, FIXTURE_RAW.inputTokens)
+    assert.notEqual(fixtureSum24 + fixtureLast, FIXTURE_PROMPT)
     const reportedSum = responses.reduce((sum, parsed) => sum + usageTotal(parsed.usage), 0)
-    const residual = FIXTURE_RAW.inputTokens - toolResponses.reduce((sum, parsed) => sum + usageTotal(parsed.usage), 0)
-    assert.notEqual(reportedSum, FIXTURE_RAW.inputTokens, "估算求和恰好守恒，与口径假设不符，需重新核对夹具")
+    const residual = FIXTURE_PROMPT - toolResponses.reduce((sum, parsed) => sum + usageTotal(parsed.usage), 0)
+    assert.notEqual(reportedSum, FIXTURE_PROMPT, "估算求和恰好守恒，与口径假设不符，需重新核对夹具")
     assert.notEqual(finalTotal, residual, "末步被用累计残差补平，不是单次窗口")
-    const errorRatio = (reportedSum - FIXTURE_RAW.inputTokens) / FIXTURE_RAW.inputTokens
+    const errorRatio = (reportedSum - FIXTURE_PROMPT) / FIXTURE_PROMPT
     assert.ok(Math.abs(errorRatio) < 0.1, `估算总误差 ${(errorRatio * 100).toFixed(2)}% 超出量级`)
-    console.log(`# 25 步估算求和 ${reportedSum}，上游累计 ${FIXTURE_RAW.inputTokens}，误差 ${(errorRatio * 100).toFixed(2)}%（不承诺守恒）`)
+    console.log(`# 25 步估算求和 ${reportedSum}，上游累计 ${FIXTURE_PROMPT}，误差 ${(errorRatio * 100).toFixed(2)}%（不承诺守恒）`)
 
   })
 })
@@ -441,7 +473,7 @@ test("缺失、非数值、无穷、负数 usage 字段被清理成非负有限�
 test("取消后重试：被取消回合的 usage 不并入重试响应", async () => {
   await withKit({}, async (kit) => {
     const cancelled = { inputTokens: 777_777, cachedReadTokens: 0, outputTokens: 3 }
-    const retry = { inputTokens: 1200, cachedReadTokens: 200, outputTokens: 7 }
+    const retry = { inputTokens: 1000, cachedReadTokens: 200, outputTokens: 7 }
     kit.prompts.push(async (agent) => {
       await agent.text("partial answer")
       await agent.waitCancel()
@@ -500,41 +532,71 @@ test("同一 HTTP 步骤不会被重复结算", async () => {
 
 // --------------------------------------------------------------- 校准与 Proc 隔离
 
-test("单步校准系数与缓存占比只在同一 Proc 内沿用，不同 Proc 互不影响", async () => {
+test("单步校准系数与缓存占比在同一 Proc 内按模型族隔离，不同 Proc 互不影响", async () => {
   await withKit({}, async (kit) => {
-    const base = await padBodyToTokens(kit, baseBody({ messages: [{ role: "user", content: "conversation A" }] }), 4000)
+    const GEMINI = "yce-magpie-agy/gemini-4-argon[1m]"
+    const CLAUDE = "yce-magpie-agy/claude-sonnet-5-5"
+    const base = await padBodyToTokens(kit, baseBody({ model: GEMINI, messages: [{ role: "user", content: "conversation A" }] }), 4000)
     const estimateA1 = await kit.countTokens(base)
     const calibrated = Math.round(estimateA1 * 1.2)
     const cachedA = Math.round(calibrated * 0.25)
     kit.prompts.push(async (agent) => {
       await agent.text("A first answer")
-      return { stopReason: "end_turn", usage: { inputTokens: calibrated, cachedReadTokens: cachedA, outputTokens: 5 } }
+      return { stopReason: "end_turn", usage: acpUsage({ input: calibrated - cachedA, read: cachedA, output: 5 }) }
     })
     const first = await runTurn(kit, base)
     assert.equal(usageTotal(first.responses[0].usage), calibrated)
+    const geminiFamily = kit.turns[0].family
+    assert.equal(geminiFamily, "gemini-4-argon")
+    let history = [...base.messages, { role: "assistant", content: plain(first.responses[0].content) }]
 
+    // Gemini 第二轮：工具中间步沿用 Gemini 的 scale 1.2 与 cacheRatio 0.25；末步实测保持 0.25。
     kit.prompts.push(async (agent) => {
       await agent.tool("Read", { path: "/a" })
       await agent.text("A second answer")
-      return { stopReason: "end_turn", usage: { inputTokens: 9000, outputTokens: 5 } }
+      return { stopReason: "end_turn", usage: acpUsage({ input: 6750, read: 2250, output: 5 }) }
     })
-    const followUp = {
-      ...base,
-      messages: [...base.messages, { role: "assistant", content: plain(first.responses[0].content) }, { role: "user", content: "next question" }],
-    }
-    const second = await runTurn(kit, followUp)
+    const second = await runTurn(kit, { ...base, messages: [...history, { role: "user", content: "next question" }] })
     assert.equal(kit.acpSpawns.length, 1, "同一会话没有复用 Proc，校准沿用无从验证")
     const toolStep = second.responses[0].usage
-    const expectedTotal = second.estimates[0] * 1.2
-    assert.ok(Math.abs(usageTotal(toolStep) - expectedTotal) <= 2, `同 Proc 工具步 ${usageTotal(toolStep)}，期望约 ${expectedTotal}`)
-    assert.ok(Math.abs(toolStep.cache_read_input_tokens - usageTotal(toolStep) * 0.25) <= 2, "缓存占比没有沿用")
+    assert.ok(Math.abs(usageTotal(toolStep) - second.estimates[0] * 1.2) <= 2, `同族工具步 ${usageTotal(toolStep)}，期望约 ${second.estimates[0] * 1.2}`)
+    assert.ok(Math.abs(toolStep.cache_read_input_tokens - usageTotal(toolStep) * 0.25) <= 2, "同族缓存占比没有沿用")
+    history = [...second.bodies.at(-1).messages, { role: "assistant", content: plain(second.responses.at(-1).content) }]
+
+    // 同一会话切到 Claude：同一 Proc（假 agy 不声明会话级追加），但不沿用 Gemini 的 scale 与 cacheRatio。
+    kit.prompts.push(async (agent) => {
+      await agent.tool("Read", { path: "/claude" })
+      await agent.text("Claude answer")
+      return { stopReason: "end_turn", usage: acpUsage({ input: 9000, output: 5 }) }
+    })
+    const claude = await runTurn(kit, { ...base, model: CLAUDE, messages: [...history, { role: "user", content: "claude question" }] })
+    assert.equal(kit.acpSpawns.length, 1, "切族不应换 Proc（无会话级追加时）")
+    assert.equal(kit.turns.at(-1).family, "claude-sonnet-5-5")
+    const claudeStep = claude.responses[0].usage
+    assert.ok(Math.abs(usageTotal(claudeStep) - claude.estimates[0]) <= 1, `Claude 工具步 ${usageTotal(claudeStep)} 沿用了 Gemini 的系数`)
+    assert.equal(claudeStep.cache_read_input_tokens, 0, "Claude 工具步沿用了 Gemini 的缓存占比")
+    history = [...claude.bodies.at(-1).messages, { role: "assistant", content: plain(claude.responses.at(-1).content) }]
+
+    // 切回 Gemini：沿用 Gemini 自己的校准。
+    kit.prompts.push(async (agent) => {
+      await agent.tool("Read", { path: "/back" })
+      await agent.text("Gemini again")
+      return { stopReason: "end_turn", usage: acpUsage({ input: 6750, read: 2250, output: 5 }) }
+    })
+    const back = await runTurn(kit, { ...base, model: GEMINI, messages: [...history, { role: "user", content: "gemini again" }] })
+    const backStep = back.responses[0].usage
+    assert.ok(Math.abs(usageTotal(backStep) - back.estimates[0] * 1.2) <= 2, `切回 Gemini 工具步 ${usageTotal(backStep)} 丢了 Gemini 的系数`)
+    assert.ok(Math.abs(backStep.cache_read_input_tokens - usageTotal(backStep) * 0.25) <= 2, "切回 Gemini 丢了 Gemini 的缓存占比")
+    const proc = kit.turns[0].proc
+    assert.equal(proc.calibration.get("claude-sonnet-5-5").cacheRatio, 0)
+    assert.ok(Math.abs(proc.calibration.get(geminiFamily).cacheRatio - 0.25) < 0.001)
 
     kit.prompts.push(async (agent) => {
       await agent.tool("Read", { path: "/b" })
       await agent.text("B answer")
-      return { stopReason: "end_turn", usage: { inputTokens: 9000, outputTokens: 5 } }
+      return { stopReason: "end_turn", usage: acpUsage({ input: 9000, output: 5 }) }
     })
-    const other = await padBodyToTokens(kit, baseBody({ messages: [{ role: "user", content: "conversation B" }] }), 4000)
+    const other = await padBodyToTokens(kit, baseBody({ model: GEMINI, messages: [{ role: "user", content: "conversation B" }] }), 4000)
     const third = await runTurn(kit, other)
     assert.equal(kit.acpSpawns.length, 2, "不同会话应使用不同 Proc")
     const isolated = third.responses[0].usage
@@ -599,15 +661,40 @@ test("SSE 与 stream:false 经同一流生成/消费路径得到相同内容与 
       }),
     }
   })
+  // magpie.exe 0.1.3150 (*Usage).add：message_start.message.usage 与顶层 usage 都读，新值 >0 才覆盖。
+  const magpieMerge = (events) => {
+    const merged = { ...ZERO_USAGE }
+    const add = (usage) => {
+      for (const key of Object.keys(ZERO_USAGE)) if (usage?.[key] > 0) merged[key] = usage[key]
+    }
+    for (const { event, data } of events) {
+      if (event === "message_start") add(data.message?.usage)
+      else if (data?.usage) add(data.usage)
+    }
+    return merged
+  }
+  const four = (usage) => Object.fromEntries(Object.keys(ZERO_USAGE).map((key) => [key, usage[key]]))
   const results = []
   for (const stream of [true, false]) {
     await withKit({}, async (kit) => {
       scenario(kit)
       const { responses } = await runTurn(kit, baseBody(), { stream })
-      for (const parsed of responses) assertCleanUsage(parsed.usage, `stream=${stream}`)
+      for (const parsed of responses) {
+        assertCleanUsage(parsed.usage, `stream=${stream}`)
+        for (const key of Object.keys(ZERO_USAGE)) assert.ok(key in parsed.usage, `stream=${stream} usage 缺字段 ${key}`)
+        if (!stream) continue
+        const start = parsed.events.find((item) => item.event === "message_start")
+        assert.deepEqual(plain(start.data.message.usage), ZERO_USAGE, "message_start 必须四字段全 0")
+        assert.deepEqual(magpieMerge(parsed.events), four(parsed.usage), "按 Magpie 正数覆盖规则合并后必须等于 message_delta")
+      }
       results.push(normalize(responses))
     })
   }
   assert.equal(results[0].length, 2)
+  for (const [index, response] of results[0].entries()) {
+    for (const key of Object.keys(ZERO_USAGE)) {
+      assert.equal(results[1][index].usage[key], response.usage[key], `响应 #${index + 1} ${key}：JSON ${results[1][index].usage[key]} ≠ SSE ${response.usage[key]}`)
+    }
+  }
   assert.deepEqual(results[1], results[0])
 })

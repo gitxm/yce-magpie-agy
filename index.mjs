@@ -67,9 +67,25 @@ const ACP_LINE_LIMIT = 64 * 1024 * 1024
 const LOG_TAIL_BYTES = 256 * 1024
 const NPM_ANTHROPIC = "@ai-sdk/anthropic"
 const PING_INTERVAL_MS = 15_000
-// agy reports an upstream failure as an ordinary message chunk followed by end_turn.
-const AGENT_ERROR_MARKER = "\n⚠ Agent execution terminated due to error.\n"
-const AGENT_ERROR_CORE = AGENT_ERROR_MARKER.trim()
+// agy reports an upstream failure or in-band retry warning as an ordinary
+// message chunk ("\n⚠ <message>\n") followed by end_turn on terminal failure.
+const AGENT_RETRY_BODY_PREFIX = "Encountered retryable error from model provider"
+const AGENT_TERMINAL_ERROR_PREFIXES = [
+  "Agent execution terminated due to error.",
+  "Our servers are experiencing high traffic right now, please try again in a minute.",
+  "You have exhausted your quota on this model.",
+  "Your AI credits balance is too low to continue.",
+  "Authentication expired. Please log back in.",
+  "There was a network issue connecting to the server, please try again.",
+  "The model API is currently overloaded and may experience intermittent errors.",
+  "The model encountered an internal error.",
+  "The model is currently unreachable.",
+  "Model produced invalid output.",
+  "The model produced an invalid tool call.",
+  "Mid-stream error",
+]
+const AGENT_ALL_BANNER_PREFIXES = [AGENT_RETRY_BODY_PREFIX, ...AGENT_TERMINAL_ERROR_PREFIXES]
+const AGENT_BANNER_HOLD_LIMIT = 16 * 1024
 
 const FALLBACK_MODELS = [
   { id: "gemini-4-argon-high", name: "Gemini 4 Argon (High)", effort: "high" },
@@ -725,7 +741,10 @@ class Turn {
     this.finalized = false
     this.cancelRequested = false
     this.agentError = false
+    this.agentErrorMessage = ""
     this.heldText = ""
+    this.emittedAnyText = false
+    this.droppingRetryLine = false
     this.timer = null
     this.cleanupTimer = null
     this.logOffset = 0
@@ -744,6 +763,9 @@ class Turn {
     // separate, exact cost ledger for the accumulated ACP prompt usage.
     this.rawAcpUsages = []
     this.rawUsage = null
+    // Set by Proc.startTurn: the agy model and its calibration family.
+    this.model = ""
+    this.family = "default"
     this.accountedPrompts = new Set()
     let settle
     this.settled = new Promise((resolve) => { settle = resolve })
@@ -821,15 +843,31 @@ class Turn {
     step.usage = usage
     this.emittedOutputTokens = tokenCount(this.emittedOutputTokens + usage.output_tokens)
     if (!final) this.toolResponseCount++
+    // Calibration is per model family (see calibrationFamily) and learns only
+    // from the turn's own measured ACP numbers. A synthesized context floor, a
+    // missing usage object or a cancelled turn teaches nothing.
+    if (!final || !calibrate || step.usageKind === "context_floor") return
+    const family = this.family || calibrationFamily(this.model)
+    const previous = this.proc.calibration.get(family) || { scale: 1, cacheRatio: 0, at: 0 }
+    const next = { ...previous }
+    let changed = false
     const total = usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens
     const estimate = this.stepInputEstimates[step.estimateIndex] || step.inputEstimate
-    // Calibrate only from samples of context magnitude. An incremental ACP
-    // result.usage (a fraction of the window) or a synthesized floor value
-    // would otherwise drag inputTokenScale to its lower clamp for later steps.
-    if (calibrate && total > 0 && estimate > 0 && total >= 0.5 * estimate && step.usageKind !== "context_floor") {
-      this.proc.inputTokenScale = Math.max(0.5, Math.min(1.5, total / estimate))
-      this.proc.lastCacheRatio = Math.max(0, Math.min(1, usage.cache_read_input_tokens / total))
+    // Only an exact lone model call measures the tokenizer; an incremental ACP
+    // result.usage (a fraction of the window) would drag the scale to its clamp.
+    if (step.usageKind === "exact" && total > 0 && estimate > 0 && total >= 0.5 * estimate) {
+      next.scale = Math.max(0.5, Math.min(1.5, total / estimate))
+      changed = true
     }
+    const raw = this.rawUsage
+    const input = tokenCount(raw?.inputTokens)
+    const read = tokenCount(raw?.cachedReadTokens)
+    const write = tokenCount(raw?.cachedWriteTokens)
+    if (input + read > 0) {
+      next.cacheRatio = Math.max(0, Math.min(1, read / (input + read + write)))
+      changed = true
+    }
+    if (changed) this.proc.calibration.set(family, { ...next, at: Date.now() })
   }
 
   attach() {
@@ -882,33 +920,108 @@ class Turn {
     })
   }
 
-  // Withholds a possible prefix of agy's error marker until it can be classified.
+  // Filters agy's in-band retry banners ("\n⚠ Encountered retryable error...\n")
+  // and recognizes terminal error banners without altering normal "⚠ " output.
   pushText(chunk) {
-    if (this.done || this.agentError) return
+    if (this.done || this.agentError || !chunk) return
+    if (this.droppingRetryLine) {
+      const nl = chunk.indexOf("\n")
+      if (nl < 0) return
+      this.droppingRetryLine = false
+      chunk = chunk.slice(nl + 1)
+      if (!chunk) return
+    }
     let text = this.heldText + chunk
     this.heldText = ""
-    const marker = text.indexOf(AGENT_ERROR_CORE)
-    if (marker >= 0) {
-      this.agentError = true
-      text = text.slice(0, marker).replace(/\n$/, "")
-      if (text) this.push({ type: "text", text })
+    const emit = (part) => {
+      if (!part) return
+      this.emittedAnyText = true
+      this.push({ type: "text", text: part })
+    }
+    while (text) {
+      let idx = -1
+      let header = ""
+      if (!this.emittedAnyText && text.startsWith("⚠ ")) {
+        idx = 0
+        header = "⚠ "
+      } else {
+        idx = text.indexOf("\n⚠ ")
+        if (idx >= 0) header = "\n⚠ "
+      }
+      if (idx < 0) break
+      if (idx > 0) emit(text.slice(0, idx))
+      const rest = text.slice(idx)
+      const body = rest.slice(header.length)
+      const lineEnd = body.indexOf("\n")
+      const line = lineEnd >= 0 ? body.slice(0, lineEnd) : body
+      const isRetry = line.startsWith(AGENT_RETRY_BODY_PREFIX)
+      const isTerminal = !isRetry && AGENT_TERMINAL_ERROR_PREFIXES.some((prefix) => line.startsWith(prefix))
+      const isPartial = lineEnd < 0 && !isRetry && !isTerminal &&
+        AGENT_ALL_BANNER_PREFIXES.some((prefix) => prefix.startsWith(body))
+      if (lineEnd < 0 && (isRetry || isTerminal || isPartial)) {
+        if (rest.length < AGENT_BANNER_HOLD_LIMIT) {
+          this.heldText = rest
+          return
+        }
+        if (isRetry) {
+          this.droppingRetryLine = true
+          return
+        }
+        if (isTerminal) {
+          this.agentError = true
+          this.agentErrorMessage = body.slice(0, 1000).trim()
+          return
+        }
+      }
+      if (isRetry) {
+        text = lineEnd >= 0 ? body.slice(lineEnd + 1) : ""
+        continue
+      }
+      if (isTerminal) {
+        this.agentError = true
+        this.agentErrorMessage = line.slice(0, 1000).trim()
+        return
+      }
+      emit(header)
+      text = body
+    }
+    if (!text) return
+    if (!this.emittedAnyText && text === "⚠") {
+      this.heldText = text
       return
     }
-    for (let keep = Math.min(text.length, AGENT_ERROR_MARKER.length - 1); keep > 0; keep--) {
-      if (AGENT_ERROR_MARKER.startsWith(text.slice(-keep))) {
-        this.heldText = text.slice(-keep)
-        text = text.slice(0, -keep)
-        break
+    for (const prefix of ["\n⚠", "\n"]) {
+      if (text.endsWith(prefix)) {
+        emit(text.slice(0, -prefix.length))
+        this.heldText = prefix
+        return
       }
     }
-    if (text) this.push({ type: "text", text })
+    emit(text)
   }
 
   flushText() {
-    if (!this.heldText || this.agentError) return
-    const text = this.heldText
+    this.droppingRetryLine = false
+    if (!this.heldText || this.agentError) {
+      this.heldText = ""
+      return
+    }
+    const rest = this.heldText
     this.heldText = ""
-    this.push({ type: "text", text })
+    const header = !this.emittedAnyText && rest.startsWith("⚠ ")
+      ? "⚠ "
+      : rest.startsWith("\n⚠ ") ? "\n⚠ " : ""
+    if (header) {
+      const body = rest.slice(header.length)
+      if (body.startsWith(AGENT_RETRY_BODY_PREFIX)) return
+      if (AGENT_TERMINAL_ERROR_PREFIXES.some((prefix) => body.startsWith(prefix))) {
+        this.agentError = true
+        this.agentErrorMessage = body.slice(0, 1000).trim()
+        return
+      }
+    }
+    this.emittedAnyText = true
+    this.push({ type: "text", text: rest })
   }
 
   complete(result) {
@@ -977,19 +1090,24 @@ class Proc {
     this.model = opts.model
     this.selection = opts.selection
     this.tools = opts.tools
-    this.toolsSignature = JSON.stringify(opts.tools)
+    // Key order of a client's tool schemas is not a catalog change.
+    this.toolsSignature = stableJSON(opts.tools)
     this.workDir = opts.workDir
     this.instructions = opts.instructions || ""
+    this.instructionsPlacement = opts.instructionsPlacement || instructionsPlacement(opts.model)
     this.resumeFrom = opts.resume || null
+    // Tokenizer scales survive a replacement process; cache ratios do not,
+    // because a new upstream session starts cold.
+    this.inheritedCalibration = opts.inheritCalibration || null
     this.token = randomUUID()
     this.sessionId = null
     this.currentModel = null
     this.agentVersion = null
     this.supportsImages = false
-    // Learned from settled single-model-call responses; scales the local input
-    // estimate used for tool-step responses that carry no exact usage.
-    this.inputTokenScale = 1
-    this.lastCacheRatio = 0
+    // Per model family: { scale, cacheRatio, at }. The scale is learned from
+    // exact single-model-call responses and sizes the local input estimate;
+    // the cache ratio comes from measured ACP read/input/write counts.
+    this.calibration = new Map()
     this.configOptions = []
     this.configMethodUnsupported = false
     this.currentSelectionKey = null
@@ -1115,33 +1233,48 @@ class Proc {
       capabilities.prompt_capabilities?.image === true
     const appendable = capabilities._meta?.antigravity?.systemPrompt?.append === true
     const resumable = !!(capabilities.sessionCapabilities?.resume ?? capabilities.session_capabilities?.resume)
-    this.instructionsInSession = appendable && !!this.instructions
-    const meta = this.instructionsInSession
-      ? { _meta: { antigravity: { systemPrompt: { append: this.instructions } } } }
-      : {}
+    // Only Gemini sessions take the client system prompt as a session-level
+    // append; other families get it inline in the first prompt (instructionsPlacement).
+    const placement = this.instructionsPlacement
+    this.instructionsInSession = appendable && !!this.instructions && placement === "session"
+    const appendMeta = { _meta: { antigravity: { systemPrompt: { append: this.instructions } } } }
 
     let session = null
     if (this.resumeFrom && resumable) {
+      // An inline session already carries its instructions in its history.
+      const resumeInSession = this.instructionsInSession && this.resumeFrom.instructionsInSession !== false
       try {
         session = await this.conn.request("session/resume", {
           sessionId: this.resumeFrom.sessionId,
           cwd: this.workspace,
           mcpServers: [],
-          ...meta,
+          ...(resumeInSession ? appendMeta : {}),
         })
         if (!session || typeof session !== "object") throw new Error("empty session/resume result")
         this.sessionId = this.resumeFrom.sessionId
         this.resumed = true
         this.hasSentFirstTurn = true
+        this.instructionsInSession = resumeInSession
         this.expectedMessages = this.resumeFrom.expectedMessages.map((message) => ({ ...message }))
-      } catch {
+        consumeParked(this.resumeFrom.key, this.resumeFrom.sessionId)
+        restoreCalibration(this, this.resumeFrom.calibration, true)
+      } catch (error) {
         session = null
+        const reason = resumeFailureReason(error, this)
+        // Only a session agy says is gone is dropped; a timeout, a crash or any
+        // other transient failure keeps the record for a later attempt.
+        if (reason === "session_gone") consumeParked(this.resumeFrom.key, this.resumeFrom.sessionId)
+        logBridgeEvent(this, null, "resume_failed", reason, { convKey: this.convKey })
       }
     }
     if (!this.resumed) {
-      session = await this.conn.request("session/new", { cwd: this.workspace, mcpServers: [], ...meta })
+      this.instructionsInSession = appendable && !!this.instructions && placement === "session"
+      session = await this.conn.request("session/new", {
+        cwd: this.workspace, mcpServers: [], ...(this.instructionsInSession ? appendMeta : {}),
+      })
       if (!session?.sessionId) throw new Error("agy session/new returned no sessionId")
       this.sessionId = session.sessionId
+      restoreCalibration(this, this.inheritedCalibration || this.resumeFrom?.calibration, false)
     }
     // A resumed session reports the account default; always apply the selection.
     this.currentModel = session?.models?.currentModelId ?? null
@@ -1227,7 +1360,9 @@ class Proc {
 
   // Swap the client tool catalog in place; agy re-lists on tools/list_changed.
   async updateTools(tools) {
-    const signature = JSON.stringify(tools)
+    // Same catalog up to key order: keep the original objects so agy's next
+    // tools/list returns the same bytes and no tools_changed is announced.
+    const signature = stableJSON(tools)
     if (signature === this.toolsSignature) return
     this.tools = tools
     this.toolsSignature = signature
@@ -1289,6 +1424,9 @@ class Proc {
       throw new UnsupportedContent("image input with this agy ACP server; update to an image-capable agy version")
     }
     const turn = new Turn(this, messages)
+    // Settlement and calibration of this turn belong to the model it runs on.
+    turn.model = model || this.currentModel || this.model || ""
+    turn.family = calibrationFamily(turn.model)
     this.turn = turn
     this.expectedMessages = messages.map((message) => ({ ...message }))
     this.historyInvalid = false
@@ -1360,22 +1498,32 @@ class Proc {
         // A cancel that arrived before the prompt would be ignored by agy.
         if (turn.cancelRequested) {
           if (this.hasSentFirstTurn) this.unsentPrompt = promptParts
+          else this.expectedMessages = null
           turn.complete({ stopReason: "cancelled" })
           return
         }
         turn.arm()
         unpark(this.convKey, this.account)
-        this.hasSentFirstTurn = true
         const promptNumber = turn.beginPrompt(promptParts, lateCalls)
-        const result = await this.conn.request("session/prompt", {
-          sessionId: this.sessionId,
-          prompt: promptParts.length ? promptParts : [{ type: "text", text: "" }],
-        })
+        let promptSent = false
+        let result
+        try {
+          promptSent = true
+          result = await this.conn.request("session/prompt", {
+            sessionId: this.sessionId,
+            prompt: promptParts.length ? promptParts : [{ type: "text", text: "" }],
+          })
+        } catch (error) {
+          if (promptSent && turn.cancelRequested && !this.dead) this.hasSentFirstTurn = true
+          throw error
+        }
         usage = turn.recordPromptUsage(promptNumber, result?.usage)
         if (turn.cancelRequested) {
+          this.hasSentFirstTurn = true
           turn.complete({ stopReason: "cancelled" })
           return
         }
+        turn.flushText()
         if (turn.agentError) {
           throw await this.#agentError(turn)
         }
@@ -1383,7 +1531,7 @@ class Proc {
           const detail = await lastAgentError(this.logPath, turn.logOffset)
           if (detail) throw this.#formatAgentError(detail)
         }
-        turn.flushText()
+        this.hasSentFirstTurn = true
         // agy ended the turn without waiting for a long-running client tool:
         // deliver its real result in a follow-up prompt of the same response.
         const late = turn.calls.filter((call) => call.deferred && !call.lateDelivered)
@@ -1399,12 +1547,13 @@ class Proc {
       }
     } catch (error) {
       if (turn.cancelRequested && !this.dead) {
+        if (!this.hasSentFirstTurn) this.expectedMessages = null
         turn.complete({ stopReason: "cancelled" })
         return
       }
       if (error instanceof AgentTurnError && !this.dead && !turn.calls.length) {
         // agy kept the session; a retry of the same request continues in it.
-        this.expectedMessages = turn.baseHistory
+        this.expectedMessages = this.hasSentFirstTurn ? turn.baseHistory : null
         turn.fail(error)
         return
       }
@@ -1421,20 +1570,22 @@ class Proc {
 
   async #agentError(turn) {
     const detail = await lastAgentError(this.logPath, turn.logOffset)
-    return this.#formatAgentError(detail)
+    return this.#formatAgentError(detail, turn.agentErrorMessage)
   }
 
-  #formatAgentError(detail) {
-    if (/QUOTA_EXHAUSTED|RESOURCE_EXHAUSTED|MODEL_CAPACITY_EXHAUSTED|code 429\b/i.test(detail)) {
+  #formatAgentError(detail, markerMessage = "") {
+    const summary = detail || markerMessage || ""
+    const combined = [detail, markerMessage].filter(Boolean).join("\n")
+    if (/QUOTA_EXHAUSTED|RESOURCE_EXHAUSTED|MODEL_CAPACITY_EXHAUSTED|RATE_LIMIT_EXCEEDED|code 429\b|exhausted your quota|experiencing high traffic|currently overloaded/i.test(combined)) {
       return new AgentTurnError(
-        `agy bridge: Antigravity quota or rate limit reached${detail ? ": " + detail : ""}`,
+        `agy bridge: Antigravity quota or rate limit reached${summary ? ": " + summary : ""}`,
         "rate_limit_error",
-        /MODEL_CAPACITY_EXHAUSTED/i.test(detail) ? "capacity" :
-          /\b(?:QUOTA_EXHAUSTED|RESOURCE_EXHAUSTED)\b/i.test(detail) ? "account" : null,
+        /MODEL_CAPACITY_EXHAUSTED|experiencing high traffic|currently overloaded/i.test(combined) ? "capacity" :
+          /\b(?:QUOTA_EXHAUSTED|RESOURCE_EXHAUSTED)\b|exhausted your quota/i.test(combined) ? "account" : null,
       )
     }
-    const error = new AgentTurnError(`agy bridge: agy stopped the turn because of an error${detail ? ": " + detail : ""}`)
-    error.authenticationFailed = /\bUNAUTHENTICATED\b|\binvalid_grant\b|refresh token (?:has )?(?:expired|revoked)|login required/i.test(detail)
+    const error = new AgentTurnError(`agy bridge: agy stopped the turn because of an error${summary ? ": " + summary : ""}`)
+    error.authenticationFailed = /\bUNAUTHENTICATED\b|\binvalid_grant\b|refresh token (?:has )?(?:expired|revoked)|login required|authentication expired/i.test(combined)
     return error
   }
 
@@ -1702,7 +1853,9 @@ class Proc {
       if (alive()) {
         const closed = once(child, "close").catch(() => {})
         if (process.platform === "win32" && child.pid) {
-          await execOnce("taskkill", ["/T", "/F", "/PID", String(child.pid)], { timeoutMs: 3_000 })
+          await execOnce("taskkill", ["/T", "/F", "/PID", String(child.pid)], { timeoutMs: 5_000 })
+          // taskkill can report exit before descendant pipes release the cwd.
+          await Promise.race([closed, new Promise((resolve) => setTimeout(resolve, 2_000))])
         } else {
           try { child.kill("SIGTERM") } catch {}
           await Promise.race([closed, new Promise((resolve) => setTimeout(resolve, 3_000))])
@@ -1715,13 +1868,13 @@ class Proc {
     }
     this.child = null
     if (this.workspace) {
-      for (let attempt = 0; attempt < 4; attempt++) {
+      for (let attempt = 0; attempt < 8; attempt++) {
         try {
           await fs.promises.rm(this.workspace, { recursive: true, force: true })
           break
         } catch (error) {
-          if (attempt === 3 || !["EBUSY", "EPERM", "ENOTEMPTY"].includes(error?.code)) break
-          await new Promise((resolve) => setTimeout(resolve, 50 * (attempt + 1)))
+          if (attempt === 7 || !["EBUSY", "EPERM", "ENOTEMPTY"].includes(error?.code)) break
+          await new Promise((resolve) => setTimeout(resolve, 100 * (attempt + 1)))
         }
       }
     }
@@ -1918,31 +2071,34 @@ function withStateLock(file, fn) {
   }
 }
 
+// Caller holds the state lock.
+function writeParkedLocked(file, legacyAccount = null) {
+  const merged = new Map()
+  for (const entry of readStateFile().filter(validEntry)) merged.set(parkedKey(entry), entry)
+  for (const key of unparked) merged.delete(key)
+  for (const [key, entry] of parked) {
+    if ((merged.get(key)?.at ?? 0) <= entry.at) merged.set(key, entry)
+  }
+  const entries = [...merged.values()].sort((a, b) => a.at - b.at).slice(-MAX_PARKED)
+    .map(entry => legacyAccount && !entry.account ? { ...entry, account: legacyAccount } : entry)
+  const temp = `${file}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`
+  fs.writeFileSync(temp, JSON.stringify({ version: 1,
+    ...((accountSwitchOccurred || legacyAccount) ? { accountSwitchOccurred: true } : {}), entries }) + "\n", { mode: 0o600 })
+  fs.renameSync(temp, file)
+  unparked.clear()
+  if (legacyAccount) {
+    accountSwitchOccurred = true
+    parked.clear()
+    for (const entry of entries) parked.set(parkedKey(entry), entry)
+  }
+  return true
+}
+
 // Merge with the file so concurrent bridge processes do not erase each other.
 function saveParked({ legacyAccount = null } = {}) {
   const file = sessionStateFile()
   try {
-    return withStateLock(file, () => {
-      const merged = new Map()
-      for (const entry of readStateFile().filter(validEntry)) merged.set(parkedKey(entry), entry)
-      for (const key of unparked) merged.delete(key)
-      for (const [key, entry] of parked) {
-        if ((merged.get(key)?.at ?? 0) <= entry.at) merged.set(key, entry)
-      }
-      const entries = [...merged.values()].sort((a, b) => a.at - b.at).slice(-MAX_PARKED)
-        .map(entry => legacyAccount && !entry.account ? { ...entry, account: legacyAccount } : entry)
-      const temp = `${file}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`
-      fs.writeFileSync(temp, JSON.stringify({ version: 1,
-        ...((accountSwitchOccurred || legacyAccount) ? { accountSwitchOccurred: true } : {}), entries }) + "\n", { mode: 0o600 })
-      fs.renameSync(temp, file)
-      unparked.clear()
-      if (legacyAccount) {
-        accountSwitchOccurred = true
-        parked.clear()
-        for (const entry of entries) parked.set(parkedKey(entry), entry)
-      }
-      return true
-    })
+    return withStateLock(file, () => writeParkedLocked(file, legacyAccount))
   } catch { return false }
 }
 
@@ -1971,6 +2127,10 @@ function park(proc) {
     workDir: proc.workDir,
     at: Date.now(),
     ...(proc.account ? { account: proc.account } : {}),
+    // Optional (still version 1): how the session holds its instructions and
+    // the per-family calibration numbers. Never any text.
+    instructionsInSession: !!proc.instructionsInSession,
+    calibration: serializeCalibration(proc.calibration),
   }
   const key = parkedKey(entry)
   parked.delete(key)
@@ -1980,21 +2140,103 @@ function park(proc) {
   saveParked()
 }
 
-function takeParked(convKey, opts) {
+function serializeCalibration(calibration) {
+  const out = {}
+  for (const [family, value] of calibration || []) {
+    const scale = Number(value?.scale)
+    const cacheRatio = Number(value?.cacheRatio)
+    if (Number.isFinite(scale) && Number.isFinite(cacheRatio)) out[family] = { scale, cacheRatio }
+  }
+  return out
+}
+
+// Fills a fresh process's calibration from a parked record or a replaced
+// process. A resumed session keeps its warm cache ratio; a new session only
+// keeps the tokenizer scale and starts its cache ratio at 0.
+function restoreCalibration(proc, source, withCacheRatio) {
+  const entries = source instanceof Map ? [...source] : Object.entries(source && typeof source === "object" ? source : {})
+  for (const [family, value] of entries) {
+    if (typeof family !== "string" || !family) continue
+    const scale = Number(value?.scale)
+    const cacheRatio = Number(value?.cacheRatio)
+    proc.calibration.set(family, {
+      scale: Number.isFinite(scale) ? Math.max(0.5, Math.min(1.5, scale)) : 1,
+      cacheRatio: withCacheRatio && Number.isFinite(cacheRatio) ? Math.max(0, Math.min(1, cacheRatio)) : 0,
+      at: Date.now(),
+    })
+  }
+}
+
+// How a parked record holds its instructions. Records written before the field
+// existed were appended whenever there were instructions (agy supported it).
+function parkedInstructionsInSession(entry) {
+  if (typeof entry.instructionsInSession === "boolean") return entry.instructionsInSession
+  return !!entry.instructionsHash && entry.instructionsHash !== digest("")
+}
+
+// Read-only check of a parked session for this request: never deletes or
+// rewrites the record. A mismatch keeps it (TTL expiry drops it later); only a
+// successful resume, or agy saying the session is gone, consumes it.
+function peekParked(convKey, opts) {
   loadParked()
   const account = currentAccountKey()
   const entry = parked.get(account ? `${account}:${convKey}` : convKey) ||
     (!accountSwitchOccurred ? parked.get(convKey) : null)
   if (!entry) return null
   if (entry.account ? entry.account !== account : accountSwitchOccurred) return null
-  const key = parkedKey(entry)
-  parked.delete(key)
-  unparked.add(key)
-  saveParked()
   if (Date.now() - entry.at > resumeTtlMs() || (entry.workDir ?? null) !== (opts.workDir ?? null) ||
     entry.instructionsHash !== digest(compactIdentity(opts.instructions)) ||
     entry.historyHash !== digest(historyKey(opts.history))) return null
-  return { sessionId: entry.sessionId, expectedMessages: opts.history }
+  const inSession = parkedInstructionsInSession(entry)
+  // A session holding appended instructions cannot serve an inline-placement
+  // model (its system prompt would apply on top of the inline copy).
+  if (inSession && instructionsPlacement(opts.model) === "inline") return null
+  return {
+    key: parkedKey(entry),
+    sessionId: entry.sessionId,
+    expectedMessages: opts.history,
+    instructionsInSession: inSession,
+    calibration: entry.calibration && typeof entry.calibration === "object" ? entry.calibration : null,
+  }
+}
+
+// Atomically drops a parked record, but only while it still names this
+// session: a concurrent bridge may already have parked a newer one there.
+function consumeParked(key, sessionId) {
+  if (!key) return false
+  loadParked()
+  const file = sessionStateFile()
+  try {
+    return withStateLock(file, () => {
+      const inMemory = parked.get(key)
+      const onDisk = readStateFile().find(entry => entry && parkedKey(entry) === key)
+      if (inMemory && inMemory.sessionId === sessionId) parked.delete(key)
+      if (!onDisk || onDisk.sessionId === sessionId) unparked.add(key)
+      else if (inMemory && inMemory.sessionId !== sessionId) return false
+      return writeParkedLocked(file)
+    }) ?? false
+  } catch { return false }
+}
+
+// session/resume failure classes. Only "session_gone" consumes the record:
+//   session_gone  ACP error -32002 (resource not found) or a message such as
+//                 "session not found|expired|invalid|does not exist|unknown|missing",
+//                 "no such session", "invalid session", "unknown session"
+//   timeout       the request or agy start timed out
+//   process_dead  agy exited or its ACP connection closed
+//   transient     anything else (kept for a later attempt)
+const SESSION_GONE_RE = /session\b.*(not\s+found|expired|invalid|does\s+not\s+exist|unknown|missing)|no\s+such\s+session|invalid\s+session|unknown\s+session/i
+const SESSION_GONE_CODES = new Set([-32002])
+
+function resumeFailureReason(error, proc) {
+  const acp = error?.acpError
+  if (acp && (SESSION_GONE_CODES.has(acp.code) || SESSION_GONE_RE.test(String(acp.message ?? "")))) return "session_gone"
+  const message = String(error?.message ?? error ?? "")
+  if (proc?.dead || /connection is closed|agy exited/i.test(message)) return "process_dead"
+  if (/timed out|timeout/i.test(message)) return "timeout"
+  // The wrapped message starts with "agy session/resume failed:", so only agy's
+  // own error text is matched against SESSION_GONE_RE above.
+  return "transient"
 }
 
 async function retire(key, proc) {
@@ -2339,10 +2581,12 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
       throw new ConflictError("agy bridge: this request carries the pending tool call but no matching result. Stop resending it; send the tool result or continue from the last self-consistent message.", "tool_state_conflict")
     }
   }
+  let inheritCalibration = null
   if (existing) {
     if (!existing.dead && existing.turn) {
       throw new BusyError("agy bridge: this conversation still has an unfinished response")
     }
+    inheritCalibration = existing.calibration
     let matchedHistory = opts.history
     if (!forceNew && !existing.dead && !existing.retiring && existing.unsentPrompt &&
       Array.isArray(opts.messages) && Array.isArray(existing.expectedMessages)) {
@@ -2357,21 +2601,33 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
       (!autoSwitchEnabled() || existing.account === currentAccountKey()) &&
       existing.minimalAgent === hostOption("minimal_agent", "AGY_BRIDGE_MINIMAL_AGENT", true) &&
       existing.matchesHistory(matchedHistory)
+    // A session holding Gemini's session-level system append cannot serve an
+    // inline-placement model: rebuild it inline, parking the old session so a
+    // switch back can resume it. The reverse (inline -> Gemini) keeps the
+    // session and never appends a second copy of the instructions.
+    const modeSwitch = existing.instructionsInSession && instructionsPlacement(opts.model) === "inline"
     if (compatible && !(isFreshConversation && existing.hasSentFirstTurn)) {
-      await existing.updateTools(opts.tools)
-      return { proc: existing, history: matchedHistory }
+      if (!modeSwitch) {
+        await existing.updateTools(opts.tools)
+        return { proc: existing, history: matchedHistory }
+      }
+      logBridgeEvent(existing, null, "rebuild", "instructions_mode_switch", opts)
+      await retire(convKey, existing)
+    } else {
+      existing.retiring = true
+      dropFromPool(existing)
+      await existing.stop().catch(() => {})
     }
-    existing.retiring = true
-    dropFromPool(existing)
-    await existing.stop().catch(() => {})
   }
   while (allProcs.size >= maxProcs()) {
     if (!(await evictLRU())) {
       throw new BusyError(`agy bridge: ${maxProcs()} agy processes are running and all have unfinished responses`)
     }
   }
-  const resume = forceNew || isFreshConversation ? null : takeParked(convKey, opts)
-  const proc = new Proc(agyPath, convKey, { ...opts, resume })
+  const resume = forceNew || isFreshConversation ? null : peekParked(convKey, opts)
+  const proc = new Proc(agyPath, convKey, {
+    ...opts, resume, instructionsPlacement: instructionsPlacement(opts.model), inheritCalibration,
+  })
   try {
     await proc.start()
   } catch (error) {
@@ -3786,20 +4042,56 @@ function tokenCount(value) {
   return Number.isFinite(number) ? Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Math.round(number))) : 0
 }
 
-// ACP usage accumulates the internal model calls of one session/prompt.
-// Gemini includes read-cache input and excludes thought output in its totals.
-function translateUsage(usage) {
+// ACP usage accumulates the internal model calls of one session/prompt, in
+// agy's exclusive ledger (same for every model family): inputTokens (I) is
+// uncached input only and excludes cachedReadTokens (R) and cachedWriteTokens
+// (W); outputTokens (O) already includes thoughtTokens (T); and
+// totalTokens = I + R + W + O. The three input buckets map one-to-one.
+// A report off this contract keeps the same mapping and is logged (numbers only).
+function translateUsage(usage, proc = null, turn = null) {
   if (!usage || typeof usage !== "object") return null
   const input = tokenCount(usage.inputTokens)
-  const cacheRead = Math.min(input, tokenCount(usage.cachedReadTokens))
+  const cacheRead = tokenCount(usage.cachedReadTokens)
+  const cacheWrite = tokenCount(usage.cachedWriteTokens)
+  const reportedOutput = tokenCount(usage.outputTokens)
   const thinking = tokenCount(usage.thoughtTokens)
-  return {
-    input_tokens: input - cacheRead,
-    output_tokens: tokenCount(tokenCount(usage.outputTokens) + thinking),
-    cache_read_input_tokens: cacheRead,
-    cache_creation_input_tokens: tokenCount(usage.cachedWriteTokens),
-    ...(thinking > 0 ? { output_tokens_details: { thinking_tokens: thinking } } : {}),
+  const output = Math.max(reportedOutput, thinking)
+  const hasTotal = usage.totalTokens !== undefined && usage.totalTokens !== null
+  const expectedTotal = input + cacheRead + cacheWrite + reportedOutput
+  const totalDelta = hasTotal ? tokenCount(usage.totalTokens) - expectedTotal : 0
+  if (totalDelta !== 0 || thinking > reportedOutput) {
+    logBridgeEvent(proc, turn, "usage", "acp_contract_mismatch", { convKey: proc?.convKey }, {
+      acp_input: input, acp_cache_read: cacheRead, acp_cache_write: cacheWrite,
+      acp_output: reportedOutput, acp_thought: thinking,
+      acp_total: hasTotal ? tokenCount(usage.totalTokens) : null, total_delta: totalDelta,
+      thought_over_output: Math.max(0, thinking - reportedOutput),
+    })
   }
+  const thinkingShown = Math.min(thinking, output)
+  return {
+    input_tokens: input,
+    output_tokens: output,
+    cache_read_input_tokens: cacheRead,
+    cache_creation_input_tokens: cacheWrite,
+    ...(thinkingShown > 0 ? { output_tokens_details: { thinking_tokens: thinkingShown } } : {}),
+  }
+}
+
+// Calibration family of an agy model id: the id without its effort suffix.
+// claude-sonnet-5-5-low -> claude-sonnet-5-5, gemini-4-argon-high -> gemini-4-argon.
+function calibrationFamily(model) {
+  const id = String(model ?? "").trim().split("/").pop().toLowerCase()
+  const pattern = new RegExp(`-(?:${EFFORT_ORDER.join("|")})$`)
+  return id.replace(pattern, "") || "default"
+}
+
+// Where a session keeps the client system prompt. Gemini benefits from agy's
+// session-level append; Claude, GPT-OSS and unknown families get it inline in
+// the first prompt, which keeps their upstream prompt cache stable. An empty
+// model resolves as the default family (gemini-4-argon).
+function instructionsPlacement(model) {
+  const id = String(model ?? "").trim().split("/").pop() || "gemini-4-argon"
+  return /^gemini-/i.test(id) ? "session" : "inline"
 }
 
 function responseOutputEstimate(content) {
@@ -3819,91 +4111,98 @@ function responseOutputEstimate(content) {
   return { output: tokenCount(output), thinking: tokenCount(thinking) }
 }
 
-function inputTokenScaleOf(proc) {
-  return Number.isFinite(proc.inputTokenScale) ? Math.max(0.5, Math.min(1.5, proc.inputTokenScale)) : 1
+function calibrationOf(proc, family) {
+  return proc?.calibration instanceof Map ? proc.calibration.get(family || "default") : null
 }
 
-function cacheRatioOf(proc) {
-  return Number.isFinite(proc.lastCacheRatio) ? Math.max(0, Math.min(1, proc.lastCacheRatio)) : 0
+function inputTokenScaleOf(proc, family) {
+  const scale = calibrationOf(proc, family)?.scale
+  return Number.isFinite(scale) ? Math.max(0.5, Math.min(1.5, scale)) : 1
+}
+
+function cacheRatioOf(proc, family) {
+  const ratio = calibrationOf(proc, family)?.cacheRatio
+  return Number.isFinite(ratio) ? Math.max(0, Math.min(1, ratio)) : 0
+}
+
+// Splits `total` input tokens over the three buckets in proportion to
+// (input, read, write): read and write are rounded, and uncached input takes
+// the remainder so the three buckets always sum to exactly `total`.
+function splitInputUsage(total, input, read, write) {
+  const whole = input + read + write
+  const cacheRead = whole > 0 ? Math.min(total, tokenCount(total * read / whole)) : 0
+  const cacheWrite = whole > 0 ? Math.min(total - cacheRead, tokenCount(total * write / whole)) : 0
+  return { input_tokens: total - cacheRead - cacheWrite, cache_read_input_tokens: cacheRead, cache_creation_input_tokens: cacheWrite }
 }
 
 // Input-side usage fields derived from a request-body estimate (the same basis
-// the intermediate tool steps use), split by the session's last cache ratio.
-function estimatedInputUsage(proc, estimate) {
-  const input = Math.max(1, tokenCount(estimate * inputTokenScaleOf(proc)))
-  const read = Math.min(input, tokenCount(input * cacheRatioOf(proc)))
-  return { input_tokens: input - read, cache_read_input_tokens: read, cache_creation_input_tokens: 0 }
+// the intermediate tool steps use), split by the family's last cache ratio.
+function estimatedInputUsage(proc, estimate, family) {
+  const total = Math.max(1, tokenCount(estimate * inputTokenScaleOf(proc, family)))
+  const read = Math.min(total, tokenCount(total * cacheRatioOf(proc, family)))
+  return { input_tokens: total - read, cache_read_input_tokens: read, cache_creation_input_tokens: 0 }
 }
 
 // Usage for one HTTP response. ACP reports one accumulated total for a whole
 // session/prompt, which may span several HTTP responses (tool round-trips and
 // late tool results). Reporting that total on the last response makes clients
 // bill the earlier steps again, so each response settles on its own:
-//   - a lone model call keeps the exact ACP numbers;
+//   - a lone model call keeps the exact ACP numbers (translateUsage);
 //   - tool-step responses get a non-zero estimate scaled by what earlier
-//     responses taught us about this model's tokenizer and cache hit rate;
-//   - the final response gets the ACP input total split by this step's share
-//     of the estimated input, never above 1.5x its own estimate;
+//     responses taught us about this model family's tokenizer and cache ratio;
+//   - the final response gets the accumulated ACP input (I + R + W) times this
+//     step's share of the estimated input, never above 1.5x its own estimate,
+//     split over the three buckets in the measured proportions;
 //   - an incremental ACP result.usage (a fraction of the window) is lifted to
-//     the estimate basis so the reported window never collapses.
+//     the estimate basis so the reported window never collapses, keeping the
+//     measured read/write proportions (usageKind "context_floor").
 function responseUsage(proc, turn, step, content, result) {
   if (step.settled) return step.usage
   const final = result !== undefined
-  const translated = final ? translateUsage(result?.usage) : null
+  const translated = final ? translateUsage(result?.usage, proc, turn) : null
   const single = final && result?.stopReason !== "cancelled" && !turn.calls.length &&
     !turn.toolResponseCount && !turn.hasLatePrompt && turn.promptCount <= 1 && turn.responseSteps.length === 1
   step.usageKind = single && translated ? "exact" : "bounded_step_estimate"
 
+  const family = turn.family || calibrationFamily(turn.model)
   const estimate = turn.stepInputEstimates[step.estimateIndex] || step.inputEstimate
-  const scale = inputTokenScaleOf(proc)
+  const scale = inputTokenScaleOf(proc, family)
+  const window = Math.max(1, tokenCount(estimate * scale))
   // ACP result.usage can be incremental (a fraction of the window) instead of
   // cumulative. A final input total below half of the scaled estimate is not a
   // context size: report the estimate basis so the window never collapses.
   const floor = estimate > 0 ? tokenCount(0.5 * estimate * scale) : 0
-  if (single && translated) {
-    const translatedTotal = translated.input_tokens + translated.cache_read_input_tokens + translated.cache_creation_input_tokens
-    if (!(floor > 0 && translatedTotal < floor)) return translated
+  const measured = translated
+    ? [translated.input_tokens, translated.cache_read_input_tokens, translated.cache_creation_input_tokens]
+    : [0, 0, 0]
+  const measuredTotal = measured[0] + measured[1] + measured[2]
+  const lifted = () => {
     step.usageKind = "context_floor"
-    return { ...translated, ...estimatedInputUsage(proc, estimate) }
+    return measuredTotal > 0 ? splitInputUsage(window, ...measured) : estimatedInputUsage(proc, estimate, family)
+  }
+  if (single && translated) {
+    if (!(floor > 0 && measuredTotal < floor)) return translated
+    return { ...translated, ...lifted() }
   }
 
-  let cacheRatio = cacheRatioOf(proc)
-  let input = Math.max(1, tokenCount(estimate * scale))
-  let write = 0
-  if (final) {
+  let inputUsage
+  if (!final || measuredTotal === 0) {
+    // No measured numbers for this step: the scaled estimate split by the
+    // family's cache ratio; nothing is known about cache writes.
+    inputUsage = estimatedInputUsage(proc, estimate, family)
+  } else {
     const sum = turn.stepInputEstimates.reduce((total, value) => total + value, 0)
     const weight = estimate / Math.max(estimate, sum)
-    const totalInput = tokenCount(result?.usage?.inputTokens)
-    const totalWrite = tokenCount(result?.usage?.cachedWriteTokens)
-    const read = Math.min(totalInput, tokenCount(result?.usage?.cachedReadTokens))
-    if (totalInput + totalWrite > 0) {
-      input = tokenCount(totalInput * weight)
-      write = tokenCount(totalWrite * weight)
-      cacheRatio = totalInput > 0 ? read / totalInput : 0
-    }
-    // The bound applies to the full window, including cache creation. Scale
-    // both portions together before rounding, then split the exact integer.
-    const combined = input + write
-    const bounded = Math.min(tokenCount(estimate * 1.5), combined)
-    write = combined > 0 ? Math.min(bounded, tokenCount(bounded * (write / combined))) : 0
-    input = bounded - write
-    if (floor > 0 && input + write < floor) {
-      step.usageKind = "context_floor"
-      input = Math.max(1, tokenCount(estimate * scale))
-      write = 0
-      cacheRatio = cacheRatioOf(proc)
-    }
+    const stepTotal = Math.min(tokenCount(measuredTotal * weight), tokenCount(1.5 * estimate))
+    inputUsage = floor > 0 && stepTotal < floor ? lifted() : splitInputUsage(stepTotal, ...measured)
   }
-  const read = Math.min(input, tokenCount(input * cacheRatio))
   const emitted = responseOutputEstimate(content)
   const output = final
     ? Math.max(emitted.output, tokenCount((translated?.output_tokens || 0) - turn.emittedOutputTokens))
     : Math.max(1, emitted.output)
   const thinking = Math.min(output, emitted.thinking)
   return {
-    input_tokens: input - read,
-    cache_read_input_tokens: read,
-    cache_creation_input_tokens: write,
+    ...inputUsage,
     output_tokens: output,
     ...(thinking > 0 ? { output_tokens_details: { thinking_tokens: thinking } } : {}),
   }
@@ -3921,7 +4220,7 @@ function thinkingSignature(sessionId, thinking) {
     createHmac("sha256", THINKING_KEY).update(String(sessionId) + "\n" + thinking).digest("base64url")
 }
 
-function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.registerResponse(body)) {
+function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.registerResponse(body), initialEvent = null) {
   const encoder = new TextEncoder()
   const responseContent = []
   const forwardThinking = hostOption("thinking_summary", "AGY_BRIDGE_THINKING", true) && body.thinking?.type !== "disabled"
@@ -4001,10 +4300,12 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
         abortHandler = null
       }
       const stopMessage = (stopReason, usage, final = false, calibrate = final) => {
+        // The final, absolute usage of this response: always all four fields
+        // (a missing one is 0), never an increment over message_start.
         send("message_delta", {
           type: "message_delta",
           delta: { stop_reason: stopReason, stop_sequence: null },
-          usage,
+          usage: usageSnapshot(usage),
         })
         turn.recordResponseUsage(step, usage, final, calibrate)
         send("message_stop", { type: "message_stop" })
@@ -4042,15 +4343,20 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
             content: [],
             stop_reason: null,
             stop_sequence: null,
-            usage: { ...estimatedInputUsage(proc, step.inputEstimate), output_tokens: 0 },
+            // Neutral on purpose: hosts that merge "a positive value replaces"
+            // (Magpie 0.1.3150) would otherwise keep an opening estimate over a
+            // real final 0. The settled numbers come in message_delta.
+            usage: { ...ZERO_USAGE },
           },
         })
         pingTimer = setInterval(() => {
           try { send("ping", { type: "ping" }) } catch {}
         }, PING_INTERVAL_MS)
 
+        let pendingEvent = initialEvent
         for (;;) {
-          const event = await turn.next()
+          const event = pendingEvent ?? await turn.next()
+          pendingEvent = null
           if (finished) return
           if (event.type === "text") {
             emitDelta("text", event.text)
@@ -4188,9 +4494,31 @@ function estimateInputTokens(body) {
   walk(body.system)
   walk(body.messages)
   if (Array.isArray(body.tools) && body.tools.length) {
-    total += estimateTextTokens(JSON.stringify(body.tools))
+    // A tool-level cache_control is a client cache hint, not model input.
+    const toolsWithoutHints = body.tools.map((tool) => {
+      if (!tool || typeof tool !== "object" || Array.isArray(tool)) return tool
+      const { cache_control: _hint, ...rest } = tool
+      return rest
+    })
+    total += estimateTextTokens(JSON.stringify(toolsWithoutHints))
   }
   return Math.max(1, total + images * 1600)
+}
+
+const ZERO_USAGE = Object.freeze({
+  input_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 0,
+})
+
+// A complete four-field usage object; output_tokens_details passes through.
+function usageSnapshot(usage) {
+  const snapshot = {
+    input_tokens: tokenCount(usage?.input_tokens),
+    cache_read_input_tokens: tokenCount(usage?.cache_read_input_tokens),
+    cache_creation_input_tokens: tokenCount(usage?.cache_creation_input_tokens),
+    output_tokens: tokenCount(usage?.output_tokens),
+  }
+  if (usage?.output_tokens_details) snapshot.output_tokens_details = { ...usage.output_tokens_details }
+  return snapshot
 }
 
 async function jsonResponseFromStream(stream, fallbackModel, fallbackId, fallbackInputUsage = null) {
@@ -4205,11 +4533,12 @@ async function jsonResponseFromStream(stream, fallbackModel, fallbackId, fallbac
     content: [],
     stop_reason: "end_turn",
     stop_sequence: null,
-    // Without a request body to estimate from, the usage stays at 0.
-    usage: { ...(fallbackInputUsage || { input_tokens: 0 }), output_tokens: 0 },
+    // message_delta carries the settled usage; message_start's is not a default.
+    usage: { ...ZERO_USAGE },
   }
   const blocks = new Map()
   let streamError = null
+  let sawDelta = false
 
   const processBlock = (raw) => {
     let eventName = ""
@@ -4222,7 +4551,8 @@ async function jsonResponseFromStream(stream, fallbackModel, fallbackId, fallbac
     let payload
     try { payload = JSON.parse(dataLine) } catch { return }
     if (eventName === "message_start" && payload.message) {
-      message = { ...message, ...payload.message, content: [] }
+      const { usage: _opening, ...opening } = payload.message
+      message = { ...message, ...opening, content: [] }
     } else if (eventName === "content_block_start" && payload.content_block) {
       blocks.set(payload.index, { ...payload.content_block, _json: "" })
     } else if (eventName === "content_block_delta" && payload.delta) {
@@ -4244,7 +4574,9 @@ async function jsonResponseFromStream(stream, fallbackModel, fallbackId, fallbac
     } else if (eventName === "message_delta") {
       if (payload.delta?.stop_reason !== undefined) message.stop_reason = payload.delta.stop_reason
       if (payload.delta?.stop_sequence !== undefined) message.stop_sequence = payload.delta.stop_sequence
-      if (payload.usage) message.usage = { ...message.usage, ...payload.usage }
+      // An absolute snapshot replaces the usage wholesale; an explicit 0 stays 0.
+      if (payload.usage) message.usage = { ...ZERO_USAGE, ...payload.usage }
+      sawDelta = true
     } else if (eventName === "error") {
       streamError = payload.error || { type: "api_error", message: "stream error" }
     }
@@ -4263,6 +4595,9 @@ async function jsonResponseFromStream(stream, fallbackModel, fallbackId, fallbac
   }
   buffer += decoder.decode()
   if (buffer.trim()) processBlock(buffer)
+  // Only a stream that ended without its message_delta falls back to the
+  // request-body estimate.
+  if (!sawDelta && fallbackInputUsage) message.usage = { ...ZERO_USAGE, ...fallbackInputUsage, output_tokens: 0 }
 
   if (streamError) {
     const status = streamError.type === "rate_limit_error" ? 429 : 502
@@ -4277,22 +4612,77 @@ async function jsonResponseFromStream(stream, fallbackModel, fallbackId, fallbac
   })
 }
 
+const ABORTED_RESPONSE = Symbol("abortedResponse")
+
+async function openStreamResponse(proc, turn, body, msgId, signal, step) {
+  const forwardThinking = hostOption("thinking_summary", "AGY_BRIDGE_THINKING", true) && body.thinking?.type !== "disabled"
+  const abortBeforeHeaders = () => {
+    turn.detach()
+    if (!proc.cancelTurn(turn, [])) {
+      dropFromPool(proc)
+      proc.abandonTurn(turn)
+      proc.stop().catch(() => {})
+    }
+    const reason = signal?.reason ?? new DOMException("The operation was aborted.", "AbortError")
+    throw { [ABORTED_RESPONSE]: true, cause: reason }
+  }
+  try {
+    if (signal?.aborted) abortBeforeHeaders()
+    for (;;) {
+      const event = await turn.next(0, signal)
+      if (!event) abortBeforeHeaders()
+      if (event.type === "thinking" && (!forwardThinking || !event.text)) continue
+      if (event.type === "text" && !event.text) continue
+      if (event.type === "error") {
+        if (!event.error?.keepProcess) {
+          dropFromPool(proc)
+          await proc.stop().catch(() => {})
+        }
+        proc.finalizeTurn(turn)
+        turn.detach()
+        afterAgentErrorResponse(proc, turn, event.error)
+        const errorType = event.error?.kind || "api_error"
+        const status = Number.isInteger(event.error?.statusCode)
+          ? event.error.statusCode
+          : errorType === "rate_limit_error" ? 429 : 502
+        return new Response(JSON.stringify({
+          type: "error",
+          error: { type: errorType, message: String(event.error?.message ?? event.error) },
+        }), {
+          status,
+          headers: { "Content-Type": "application/json" },
+        })
+      }
+      const stream = makeAnthropicStream(proc, turn, body, msgId, signal, step, event)
+      return new Response(stream, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          "Connection": "keep-alive",
+        },
+      })
+    }
+  } catch (error) {
+    if (error && typeof error === "object" && error[ABORTED_RESPONSE]) throw error
+    turn.fail(error)
+    dropFromPool(proc)
+    await proc.stop().catch(() => {})
+    proc.finalizeTurn(turn)
+    turn.detach()
+    return jsonError(502, String(error?.message ?? error))
+  }
+}
+
 function streamResponse(proc, turn, body, signal) {
   turn.attach()
   const step = turn.registerResponse(body)
   const msgId = "msg_" + randomUUID().replace(/-/g, "").slice(0, 24)
-  const stream = makeAnthropicStream(proc, turn, body, msgId, signal, step)
   if (body.stream === false) {
-    return jsonResponseFromStream(stream, body.model, msgId, estimatedInputUsage(proc, step.inputEstimate))
+    const stream = makeAnthropicStream(proc, turn, body, msgId, signal, step)
+    return jsonResponseFromStream(stream, body.model, msgId, estimatedInputUsage(proc, step.inputEstimate, turn.family))
   }
-  return new Response(stream, {
-    status: 200,
-    headers: {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      "Connection": "keep-alive",
-    },
-  })
+  return openStreamResponse(proc, turn, body, msgId, signal, step)
 }
 
 async function beginTurn(proc, history, body, callerWorkDir, model, selection) {
@@ -4550,6 +4940,10 @@ export const AntigravityBridgePlugin = async (input, packageOptions) => {
                       proc.continueWith(results)
                       proc.recordToolResults(turn, body.messages)
                     }
+                    if (accountAdmission.active) {
+                      preparingRequests--
+                      accountAdmission.active = false
+                    }
                     return streamResponse(proc, turn, body, init.signal)
                   }
                 }
@@ -4572,7 +4966,13 @@ export const AntigravityBridgePlugin = async (input, packageOptions) => {
                   // replay this request's own tool round once, under one lock.
                   const recovery = await recoverStaleTurn({ agy, convKey, proc: held, turn: held.turn,
                     body, resultBlocks, acquireOpts, isFresh, begin, attempts })
-                  if (recovery.kind === "replayed") return streamResponse(recovery.proc, recovery.turn, body, init.signal)
+                  if (recovery.kind === "replayed") {
+                    if (accountAdmission.active) {
+                      preparingRequests--
+                      accountAdmission.active = false
+                    }
+                    return streamResponse(recovery.proc, recovery.turn, body, init.signal)
+                  }
                   if (recovery.kind === "active") {
                     return jsonError(409, "agy bridge: no active MCP call matches these tool results")
                   }
@@ -4603,8 +5003,13 @@ export const AntigravityBridgePlugin = async (input, packageOptions) => {
                 resultBlocks.length > 0,
               )
               const turn = await begin(proc, history)
+              if (accountAdmission.active) {
+                preparingRequests--
+                accountAdmission.active = false
+              }
               return streamResponse(proc, turn, body, init.signal)
             } catch (error) {
+              if (error && typeof error === "object" && error[ABORTED_RESPONSE]) throw error.cause
               return jsonError(error.statusCode ?? 502, error.message, error.code, { noRetry: error.noRetry })
             } finally {
               if (accountAdmission.active) preparingRequests--

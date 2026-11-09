@@ -324,6 +324,25 @@ function acquireDirLock(lockDir) {
 
 // —— 外部 agy 在途检测 ——
 
+// Host-linked imports can create multiple module instances. Share the
+// explicit test override across those instances in the same realm.
+const PROCESS_SCANNER_FOR_TESTS = Symbol.for("magpie-agy.accounts.processScannerForTests")
+
+// Explicit in-process test seam; normal callers always use the OS scanners.
+// Return a disposer so a fixture can restore the previous scanner in finally.
+export function __setAgyProcessScannerForTests(scanner) {
+  if (typeof scanner !== "function") throw new TypeError("process scanner must be a function")
+  const previous = globalThis[PROCESS_SCANNER_FOR_TESTS]
+  globalThis[PROCESS_SCANNER_FOR_TESTS] = scanner
+  let restored = false
+  return () => {
+    if (restored) return
+    restored = true
+    if (previous) globalThis[PROCESS_SCANNER_FOR_TESTS] = previous
+    else delete globalThis[PROCESS_SCANNER_FOR_TESTS]
+  }
+}
+
 function isAgyArgv(argv) {
   if (!Array.isArray(argv) || argv.length === 0) return false
   return [argv[0], argv[1]].some((value) => typeof value === "string" && /^agy(\.exe)?$/i.test(path.basename(value.trim())))
@@ -393,7 +412,9 @@ export async function foreignAgyProcesses({ ownPids = [], platform = process.pla
   const own = new Set(ownPids.map(Number).filter(Number.isInteger))
   let scan
   try {
-    if (platform === "win32") scan = await scanWindows()
+    const processScannerForTests = globalThis[PROCESS_SCANNER_FOR_TESTS]
+    if (processScannerForTests) scan = await processScannerForTests({ platform })
+    else if (platform === "win32") scan = await scanWindows()
     else if (platform === "darwin") scan = await scanMac()
     else if (platform === "linux") scan = scanLinux()
     else return { ok: false, reason: `unsupported platform: ${platform}` }

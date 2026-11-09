@@ -4,7 +4,7 @@ import path from "node:path"
 import { execFileSync, spawn } from "node:child_process"
 import { Socket } from "node:net"
 import { seedAccountHome, createBridgeKit } from "./testkit.mjs"
-import { accountKey, acquireSwitchLock } from "./accounts.mjs"
+import { accountKey, acquireSwitchLock, __setAgyProcessScannerForTests } from "./accounts.mjs"
 
 const here = import.meta.dirname
 const suffix = `-${process.pid}`
@@ -161,11 +161,16 @@ async function invoke(name, args) {
 
 const textOf = result => (result.content || []).map(part => part.text || "").join("")
 
+// agy ACP exclusive ledger: inputTokens excludes cached reads/writes, outputTokens
+// already includes thoughtTokens, totalTokens = I + R + W + O.
 function finish(reply, extra = {}) {
   log({ type: "result", convId: session.id, prompt: session.prompts, response: reply })
+  const input = extra.input ?? 10
+  const cached = extra.cached || 0
+  const output = reply.length + (extra.thought || 0)
   return {
     stopReason: "end_turn",
-    usage: { inputTokens: extra.input ?? 10 + (extra.cached || 0), outputTokens: reply.length, cachedReadTokens: extra.cached || 0, cachedWriteTokens: 0, thoughtTokens: extra.thought || 0, totalTokens: 10 + reply.length },
+    usage: { inputTokens: input, outputTokens: output, cachedReadTokens: cached, cachedWriteTokens: 0, thoughtTokens: extra.thought || 0, totalTokens: input + cached + output },
   }
 }
 
@@ -206,6 +211,37 @@ async function prompt(params) {
     chunk("\n⚠ Agent execution ")
     chunk("terminated due to error.\n")
     return { stopReason: "end_turn" }
+  }
+  if (text.includes("RETRY_THEN_OK")) {
+    chunk("\n⚠ Encountered retryable error from model provider: 429 Too Many Requests (attempt 1/8)\n")
+    chunk("\n⚠ Encountered retryable ")
+    chunk("error from model provider: 503 Service Unavailable (attempt 2/8)\n")
+    chunk("Recovered line one\n")
+    chunk("\n⚠ Encountered retryable error from model provider: mid-stream retry\n")
+    chunk("⚠ Normal leading-looking warning after text\n⚠ Note: legitimate model warning")
+    return finish("Recovered line one\n⚠ Normal leading-looking warning after text\n⚠ Note: legitimate model warning")
+  }
+  if (text.includes("RETRY_THEN_FAIL_TRAFFIC")) {
+    chunk("\n⚠ Encountered retryable error from model provider: 429 (attempt 1/8)\n")
+    chunk("\n⚠ Encountered retryable error from model provider: 429 (attempt 8/8)\n")
+    chunk("\n⚠ Our servers are experiencing ")
+    chunk("high traffic right now, please try again in a minute.\n")
+    return { stopReason: "end_turn" }
+  }
+  if (text.includes("THINK_HIDDEN_THEN_429")) {
+    thought("suppressed internal thought")
+    chunk("\n⚠ The model API is currently overloaded and may experience intermittent errors.\n")
+    return { stopReason: "end_turn" }
+  }
+  if (text.includes("FIRST_TURN_429_ONCE")) {
+    if (session.prompts === 1) {
+      chunk("\n⚠ Encountered retryable error from model provider: 429\n")
+      chunk("\n⚠ You have exhausted your quota on this model.\n")
+      return { stopReason: "end_turn" }
+    }
+    const ok = "First turn retry ok [" + session.id + "]"
+    await reply(ok)
+    return finish(ok)
   }
   if (text.includes("CAPACITY") || text.includes("RATE_ONLY")) {
     fs.appendFileSync(agentLog, "E1103 17:11:25.570096 685 errorreport.go:224] agent executor error: generating and executing: " +
@@ -731,6 +767,33 @@ async function launchedModel(body) {
 }
 
 {
+  // Instruction placement follows the model family: Gemini keeps the client
+  // system prompt as a session-level append, Claude gets it inline. A live
+  // Gemini session that switches families to Claude is rebuilt inline; an
+  // inline session that switches back to Gemini is reused without an append.
+  const before = inits().length
+  const first = { model, system: "PLACEMENT-SYSTEM-MARKER", metadata: { user_id: "placement-switch" }, messages: [{ role: "user", content: "switch families placement first" }] }
+  const firstEvents = (await readSSE(await callFetch(first))).events
+  const geminiInit = inits().at(-1)
+  check("Gemini session carries the system prompt as a session append", inits().length === before + 1 &&
+    geminiInit.systemAppend?.includes("PLACEMENT-SYSTEM-MARKER") && !lastOf("user").text.includes("PLACEMENT-SYSTEM-MARKER"), JSON.stringify(geminiInit.systemAppend))
+  const toClaude = { ...nextTurn(first, firstEvents, "switch families to claude"), model: "yce-magpie-agy/claude-test-medium" }
+  const claudeEvents = (await readSSE(await callFetch(toClaude))).events
+  const claudeInit = inits().at(-1)
+  const claudeUser = lastOf("user")
+  check("switch families Gemini -> Claude rebuilds an inline session", stopOf(claudeEvents) === "end_turn" && inits().length === before + 2 &&
+    claudeInit.convId !== geminiInit.convId && !claudeInit.resumed && claudeInit.systemAppend === null, JSON.stringify(claudeInit))
+  check("rebuilt Claude session's first prompt carries the system prompt inline", claudeUser.convId === claudeInit.convId &&
+    claudeUser.model === "claude-test-medium" && claudeUser.text.includes("<external_system_instructions>") &&
+    claudeUser.text.includes("PLACEMENT-SYSTEM-MARKER") && claudeUser.text.includes("switch families placement first"), claudeUser.text)
+  const backToGemini = { ...nextTurn(toClaude, claudeEvents, "switch families back to gemini"), model }
+  await readSSE(await callFetch(backToGemini))
+  const geminiUser = lastOf("user")
+  check("switch families inline -> Gemini reuses the session without a second append", inits().length === before + 2 &&
+    geminiUser.convId === claudeInit.convId && geminiUser.text === "switch families back to gemini" && geminiUser.model.startsWith("gemini-test"), JSON.stringify(geminiUser))
+}
+
+{
   const initialInits = inits().length
   const first = { model, messages: [{ role: "user", content: "first message" }] }
   const firstEvents = (await readSSE(await callFetch(first))).events
@@ -1159,9 +1222,63 @@ for (const change of ["tools", "model"]) {
 }
 
 {
-  const { events } = await readSSE(await callFetch({ model, messages: [{ role: "user", content: "QUOTA exhausted" }] }))
-  const error = events.find(event => event.event === "error")?.data?.error
-  check("split error marker and quota map to rate_limit_error", error?.type === "rate_limit_error" && error.message.includes("quota exhausted") && textOf(events) === "", JSON.stringify({ error, text: textOf(events) }))
+  const response = await callFetch({ model, messages: [{ role: "user", content: "QUOTA exhausted" }] })
+  const payload = await response.json()
+  check("split error marker and quota return HTTP 429 rate_limit_error before streaming",
+    response.status === 429 && payload.error?.type === "rate_limit_error" && payload.error.message.includes("quota exhausted"),
+    JSON.stringify({ status: response.status, payload }))
+}
+
+{
+  const retryOkRes = await callFetch({ model, messages: [{ role: "user", content: "RETRY_THEN_OK check" }] })
+  const { events: retryOkEvents } = await readSSE(retryOkRes)
+  const retryOkText = textOf(retryOkEvents)
+  check("in-band retry warnings are stripped while legitimate ⚠ model text is preserved",
+    retryOkRes.status === 200 && stopOf(retryOkEvents) === "end_turn" &&
+    !retryOkText.includes("Encountered retryable error") &&
+    retryOkText === "Recovered line one\n⚠ Normal leading-looking warning after text\n⚠ Note: legitimate model warning",
+    JSON.stringify(retryOkText))
+
+  const trafficRes = await callFetch({ model, messages: [{ role: "user", content: "RETRY_THEN_FAIL_TRAFFIC check" }] })
+  const trafficPayload = await trafficRes.json()
+  check("streaming request with retry warnings then terminal traffic banner returns HTTP 429 JSON instead of 200",
+    trafficRes.status === 429 && trafficPayload.error?.type === "rate_limit_error" &&
+    trafficPayload.error.message.includes("experiencing high traffic"),
+    JSON.stringify({ status: trafficRes.status, payload: trafficPayload }))
+
+  const hiddenThinkRes = await callFetch({
+    model,
+    thinking: { type: "disabled" },
+    messages: [{ role: "user", content: "THINK_HIDDEN_THEN_429 check" }],
+  })
+  const hiddenThinkPayload = await hiddenThinkRes.json()
+  check("disabled thinking before terminal overload error still returns HTTP 429 JSON",
+    hiddenThinkRes.status === 429 && hiddenThinkPayload.error?.type === "rate_limit_error" &&
+    hiddenThinkPayload.error.message.includes("currently overloaded"),
+    JSON.stringify({ status: hiddenThinkRes.status, payload: hiddenThinkPayload }))
+
+  const beforeFirstRetryInits = inits().length
+  const firstTurnReq = {
+    model: "claude-test-medium",
+    system: `INLINE-FIRST-SYSTEM\nPrimary working directory: ${here}`,
+    messages: [{ role: "user", content: "FIRST_TURN_429_ONCE hello" }],
+  }
+  const firstFailRes = await callFetch(firstTurnReq)
+  const firstFailPayload = await firstFailRes.json()
+  const firstConvId = inits().at(-1)?.convId
+  check("first-turn quota banner returns HTTP 429 rate_limit_error",
+    firstFailRes.status === 429 && firstFailPayload.error?.type === "rate_limit_error" && inits().length === beforeFirstRetryInits + 1,
+    JSON.stringify({ status: firstFailRes.status, payload: firstFailPayload }))
+  const firstRetryRes = await callFetch(firstTurnReq)
+  const { events: firstRetryEvents } = await readSSE(firstRetryRes)
+  const retryPrompt = lastOf("user")
+  check("retrying a failed first turn reuses the live session without killing it and keeps initial instructions",
+    firstRetryRes.status === 200 && stopOf(firstRetryEvents) === "end_turn" &&
+    inits().length === beforeFirstRetryInits + 1 && retryPrompt?.convId === firstConvId &&
+    textOf(firstRetryEvents).includes(`First turn retry ok [${firstConvId}]`) &&
+    retryPrompt.text.includes("INLINE-FIRST-SYSTEM") &&
+    retryPrompt.text.includes("The caller's working directory is"),
+    JSON.stringify({ initsDelta: inits().length - beforeFirstRetryInits, retryPrompt, text: textOf(firstRetryEvents) }))
 }
 
 {
@@ -1188,9 +1305,10 @@ for (const change of ["tools", "model"]) {
   const init = inits().at(-1)
   await new Promise(resolve => setTimeout(resolve, 1200))
   const secondBody = continuation(firstBody, firstEvents, "too late")
-  const { events } = await readSSE(await callFetch(secondBody))
-  const error = events.find(event => event.event === "error")?.data?.error?.message || ""
-  check("missing client result times out explicitly", error.includes("timed out waiting for a client tool result"), error)
+  const secondRes = await callFetch(secondBody)
+  const secondPayload = await secondRes.json()
+  const error = secondPayload.error?.message || ""
+  check("missing client result times out explicitly", secondRes.status === 502 && error.includes("timed out waiting for a client tool result"), `${secondRes.status}: ${error}`)
   check("timed-out process workspace is removed", !fs.existsSync(init.cwd), init.cwd)
 }
 
@@ -1320,15 +1438,23 @@ for (const location of ["inline", "system", "developer", "user"]) {
 }
 
 {
+  process.env.FAKE_AGY_SET_MODEL_DELAY = "300"
   const first = { model, messages: [{ role: "user", content: "before an early cancel" }] }
   const firstEvents = (await readSSE(await callFetch(first))).events
   const convId = inits().at(-1).convId
-  process.env.FAKE_AGY_SET_MODEL_DELAY = "300"
   const controller = new AbortController()
   const early = nextTurn(first, firstEvents, "EARLY message that was cancelled")
-  const response = await callFetch({ ...early, model: legacyModel }, {}, controller.signal)
-  controller.abort()
-  await readSSE(response)
+  const earlyAbortTimer = setTimeout(() => controller.abort(), 30)
+  let earlyAborted = false
+  try {
+    const response = await callFetch({ ...early, model: legacyModel }, {}, controller.signal)
+    await readSSE(response)
+  } catch {
+    earlyAborted = true
+  } finally {
+    clearTimeout(earlyAbortTimer)
+  }
+  check("early cancel before first output rejects fetch cleanly", earlyAborted)
   await new Promise(resolve => setTimeout(resolve, 500))
   delete process.env.FAKE_AGY_SET_MODEL_DELAY
   check("a cancel before the prompt sends no prompt", !logs().some(event => event.type === "user" && event.text.includes("EARLY")))
@@ -1486,10 +1612,10 @@ for (const location of ["inline", "system", "developer", "user"]) {
       { role: "system", content: "SessionStart hook additional context: init" },
     ],
   }
+  process.env.FAKE_AGY_SET_MODEL_DELAY = "300"
   const openingEvents = (await readSSE(await callFetch(opening))).events
   const convId = inits().at(-1).convId
 
-  process.env.FAKE_AGY_SET_MODEL_DELAY = "300"
   const controller = new AbortController()
   const early = {
     ...opening,
@@ -1501,9 +1627,13 @@ for (const location of ["inline", "system", "developer", "user"]) {
       { role: "system", content: "UserPromptSubmit hook additional context: early-system" },
     ],
   }
-  const earlyResponse = await callFetch(early, {}, controller.signal)
-  controller.abort()
-  await readSSE(earlyResponse)
+  const earlyAbortTimer = setTimeout(() => controller.abort(), 30)
+  try {
+    const earlyResponse = await callFetch(early, {}, controller.signal)
+    await readSSE(earlyResponse)
+  } catch {} finally {
+    clearTimeout(earlyAbortTimer)
+  }
   await new Promise(resolve => setTimeout(resolve, 500))
   delete process.env.FAKE_AGY_SET_MODEL_DELAY
 
@@ -2218,21 +2348,35 @@ for (const location of ["inline", "system", "developer", "user"]) {
   process.env.AGY_BRIDGE_IDE_CALL_DEADLINE_MS = "25"
   const body = { model, metadata: { user_id: "bounded-self-poll" },
     messages: [{ role: "user", content: "LONGTOOL orphan poll regression" }], tools: [echoTool] }
-  const pending = (await readSSE(await callFetch(body))).events
-  const old = inits().at(-1)
-  for (let attempt = 0; attempt < 100 && fs.existsSync(old.cwd); attempt++) await new Promise(resolve => setTimeout(resolve, 10))
-  delete process.env.AGY_BRIDGE_IDE_CALL_DEADLINE_MS
-  const replies = logs().filter(event => event.type === "mcpResult" && event.convId === old.convId)
-  const notes = replies.filter(event => /still running/.test(event.result?.content?.[0]?.text || ""))
-  check("self polling stops after the default eight still-running replies", notes.length === 8 && !fs.existsSync(old.cwd), `${notes.length} replies`)
-  // A real tool's late result can still be replayed after the bounded wait.
-  const late = continuation(body, pending, "actual long tool result")
-  late.messages.at(-1).content.push({ type: "text", text: "[Request interrupted by user]" })
-  const response = await callFetch(late)
-  const final = response.status === 200 ? (await readSSE(response)).events : []
-  if (response.status !== 200) await response.text()
-  check("late real results survive bounded self-poll reclamation", response.status === 200 && lastOf("user").text.includes("actual long tool result"))
-  if (stopOf(final) === "tool_use") await drive(late, final, "cleanup late replay")
+  const events = []
+  const write = process.stderr.write
+  process.stderr.write = function (chunk, ...args) {
+    if (String(chunk).startsWith("[agy-bridge] ")) events.push(JSON.parse(String(chunk).slice(13)))
+    return write.call(this, chunk, ...args)
+  }
+  try {
+    const pending = (await readSSE(await callFetch(body))).events
+    const old = inits().at(-1)
+    for (let attempt = 0; attempt < 400 &&
+      (!events.some(event => event.reason === "self_poll_cap") || fs.existsSync(old.cwd)); attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 25))
+    }
+    delete process.env.AGY_BRIDGE_IDE_CALL_DEADLINE_MS
+    const replies = logs().filter(event => event.type === "mcpResult" && event.convId === old.convId)
+    const notes = replies.filter(event => /still running/.test(event.result?.content?.[0]?.text || ""))
+    check("self polling stops after the default eight still-running replies", notes.length === 8 && !fs.existsSync(old.cwd), `${notes.length} replies`)
+    // A real tool's late result can still be replayed after the bounded wait.
+    const late = continuation(body, pending, "actual long tool result")
+    late.messages.at(-1).content.push({ type: "text", text: "[Request interrupted by user]" })
+    const response = await callFetch(late)
+    const final = response.status === 200 ? (await readSSE(response)).events : []
+    if (response.status !== 200) await response.text()
+    check("late real results survive bounded self-poll reclamation", response.status === 200 && lastOf("user").text.includes("actual long tool result"))
+    if (stopOf(final) === "tool_use") await drive(late, final, "cleanup late replay")
+  } finally {
+    process.stderr.write = write
+    delete process.env.AGY_BRIDGE_IDE_CALL_DEADLINE_MS
+  }
 }
 
 {
@@ -2260,7 +2404,7 @@ for (const location of ["inline", "system", "developer", "user"]) {
     const pending = (await readSSE(response)).events
     const old = inits().at(-1)
     Date.now = () => now() + 20 * 60 * 1000 + 1
-    for (let attempt = 0; attempt < 100 && fs.existsSync(old.cwd); attempt++) await new Promise(resolve => setTimeout(resolve, 10))
+    for (let attempt = 0; attempt < 400 && fs.existsSync(old.cwd); attempt++) await new Promise(resolve => setTimeout(resolve, 25))
     const cap = events.find(event => event.reason === "self_poll_cap")
     check("twenty minutes of client inactivity beats the self-poll count cap", toolCalls(pending).length === 1 && cap?.self_poll_repeats === 1 && cap.client_idle_ms >= 20 * 60 * 1000 && !fs.existsSync(old.cwd))
     check("agy traffic does not reset the client inactivity clock", cap?.client_idle_ms >= 20 * 60 * 1000)
@@ -2281,8 +2425,9 @@ for (const location of ["inline", "system", "developer", "user"]) {
     const env = { AGY_BRIDGE_STATE_FILE: path.join(home, "state", "sessions.json") }
     return [name, { ...seedAccountHome(home, { env, capture: !["off", "wsl"].includes(name) }), env }]
   }))
-  const envKeys = ["HOME", "USERPROFILE", "XDG_STATE_HOME", "AGY_BRIDGE_STATE_FILE", "WSL_DISTRO_NAME", "FAKE_AGY_USAGE_REPORT", "FAKE_AGY_USAGE_DELAY"]
+  const envKeys = ["HOME", "USERPROFILE", "XDG_STATE_HOME", "AGY_BRIDGE_STATE_FILE", "AGY_BRIDGE_TOOL_TIMEOUT_MS", "WSL_DISTRO_NAME", "FAKE_AGY_USAGE_REPORT", "FAKE_AGY_USAGE_DELAY"]
   const savedEnv = Object.fromEntries(envKeys.map(key => [key, process.env[key]]))
+  process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS = "15000"
   const homedir = os.homedir
   const readFile = fs.readFileSync
   const readdir = fs.readdirSync
@@ -2291,6 +2436,10 @@ for (const location of ["inline", "system", "developer", "user"]) {
   const events = []
   const closedCalls = []
   let external = null
+  const restoreProcessScan = __setAgyProcessScannerForTests(() => ({
+    procs: external ? [{ pid: external.pid, ppid: null, argv: ["agy"] }] : [],
+    parentOf: new Map(),
+  }))
   let externalLock = null
   let fixture
   let switchedPlugin
@@ -2298,20 +2447,24 @@ for (const location of ["inline", "system", "developer", "user"]) {
   let serial = 0
   const pause = ms => new Promise(resolve => setTimeout(resolve, ms))
   const waitFor = async predicate => {
-    for (let i = 0; i < 200; i++) {
+    for (let i = 0; i < 400; i++) {
       if (predicate()) return true
-      await pause(20)
+      await pause(25)
     }
     return false
   }
   const active = () => JSON.parse(fs.readFileSync(fixture.accountsFile, "utf8")).active
   const send = body => switchedLoader.fetch("agy://local/messages", { method: "POST", body: JSON.stringify(body) })
   const quota = async label => {
+    const before = events.length
     const response = await send({ model, stream: false, metadata: { user_id: `quota-${++serial}` },
       messages: [{ role: "user", content: `QUOTA exhausted ${label}` }] })
     const payload = await response.json()
     check(`${label}: client keeps 429 rate_limit_error`, response.status === 429 && payload.error?.type === "rate_limit_error")
+    return before
   }
+  const switchSettled = (before, predicate = () => true) =>
+    waitFor(() => events.slice(before).some(row => row.action === "account_switch") && predicate())
   const use = async (name, enabled = true) => {
     fixture = cases[name]
     os.homedir = () => fixture.home
@@ -2319,6 +2472,7 @@ for (const location of ["inline", "system", "developer", "user"]) {
     process.env.USERPROFILE = fixture.home
     process.env.XDG_STATE_HOME = path.join(fixture.home, "state")
     process.env.AGY_BRIDGE_STATE_FILE = fixture.env.AGY_BRIDGE_STATE_FILE
+    process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS = "15000"
     delete process.env.WSL_DISTRO_NAME
     delete process.env.FAKE_AGY_USAGE_REPORT
     delete process.env.FAKE_AGY_USAGE_DELAY
@@ -2367,11 +2521,11 @@ for (const location of ["inline", "system", "developer", "user"]) {
     const toolEvents = (await readSSE(await send(tool))).events
     const usageBefore = logs().filter(row => row.type === "usage").length
     const promptsBefore = logs().filter(row => row.type === "user").length
-    await quota("two captured accounts")
-    check("quota error switches google_accounts active to the second account", await waitFor(() => active() === fixture.emails[1]))
+    const firstSwitch = await quota("two captured accounts")
+    check("quota error switches google_accounts active to the second account", await switchSettled(firstSwitch, () => active() === fixture.emails[1]))
     check("quota error swaps the token too and puts the first account in old", JSON.parse(fs.readFileSync(fixture.tokenFile, "utf8")).id_token_email === fixture.emails[1] && JSON.parse(fs.readFileSync(fixture.accountsFile, "utf8")).old.includes(fixture.emails[0]))
     check("quota failure is never automatically replayed or polled for usage", logs().filter(row => row.type === "user").length === promptsBefore + 1 && logs().filter(row => row.type === "usage").length === usageBefore)
-    check("pending tool receives ACCOUNT_SWITCH_NOTE", closedCalls.some(line => line.includes("agy bridge: this tool call was closed because the plugin switched agy accounts; stop this turn")))
+    check("pending tool receives ACCOUNT_SWITCH_NOTE", await waitFor(() => closedCalls.some(line => line.includes("agy bridge: this tool call was closed because the plugin switched agy accounts; stop this turn"))))
     const replay = (await readSSE(await send(follow))).events
     check("different account starts session/new and replays full history", !inits().at(-1).resumed && lastOf("user").text.includes("MEMORY account-bound parking") && stopOf(replay) === "end_turn")
     let toolFollow = continuation(tool, toolEvents, "result after account switch")
@@ -2382,8 +2536,8 @@ for (const location of ["inline", "system", "developer", "user"]) {
       replayTools = (await readSSE(await send(toolFollow))).events
     }
     fs.writeFileSync(path.join(fixture.vaultDir, "cooldown.json"), "{}")
-    await quota("return to original account")
-    check("second quota rotates back to the original account", await waitFor(() => active() === fixture.emails[0]))
+    const secondSwitch = await quota("return to original account")
+    check("second quota rotates back to the original account", await switchSettled(secondSwitch, () => active() === fixture.emails[0]))
     await readSSE(await send(follow))
     check("returning within TTL resumes the original account's parked session", inits().at(-1).resumed && inits().at(-1).convId === firstSession)
     check("switch events disclose only masked email addresses", events.filter(row => row.action === "account_switch").every(row => !JSON.stringify(row).includes(fixture.emails[0]) && !JSON.stringify(row).includes(fixture.emails[1])))
@@ -2391,8 +2545,8 @@ for (const location of ["inline", "system", "developer", "user"]) {
     await use("lock")
     externalLock = await acquireSwitchLock({ home: fixture.home })
     check("external lock fixture acquired the real switch lock", externalLock.ok)
-    await quota("external lock")
-    check("external switch lock prevents mutation and is logged", await waitFor(() => events.some(row => row.status === "另一切号进行中")) && active() === fixture.emails[0])
+    const lockSwitch = await quota("external lock")
+    check("external switch lock prevents mutation and is logged", await switchSettled(lockSwitch, () => events.slice(lockSwitch).some(row => row.status === "另一切号进行中")) && active() === fixture.emails[0])
     await externalLock.release()
     externalLock = null
 
@@ -2402,8 +2556,8 @@ for (const location of ["inline", "system", "developer", "user"]) {
       fs.writeFileSync(executable, "setInterval(() => {}, 1000)\n")
       external = spawn(process.execPath, [executable], { stdio: "ignore", windowsHide: true })
       await pause(30)
-      await quota("external agy")
-      check("an external fake agy blocks switching and is logged", await waitFor(() => events.some(row => /在途/.test(row.status))) && active() === fixture.emails[0])
+      const foreignSwitch = await quota("external agy")
+      check("an external fake agy blocks switching and is logged", await switchSettled(foreignSwitch, () => events.slice(foreignSwitch).some(row => /在途/.test(row.status))) && active() === fixture.emails[0])
       external.kill()
       await new Promise(resolve => external.once("close", resolve))
       external = null
@@ -2412,10 +2566,10 @@ for (const location of ["inline", "system", "developer", "user"]) {
     await use("cool")
     const reset = Date.now() + 2 * 60 * 60 * 1000
     fs.writeFileSync(path.join(fixture.vaultDir, "cooldown.json"), JSON.stringify({ [accountKey(fixture.emails[1])]: { gemini: reset } }))
-    await quota("all accounts cooling")
-    await waitFor(() => events.some(row => /最早恢复时间/.test(row.status)))
+    const coolSwitch = await quota("all accounts cooling")
+    const coolSettled = await switchSettled(coolSwitch, () => events.slice(coolSwitch).some(row => /最早恢复时间/.test(row.status)))
     const cooling = await switchedPlugin.auth.usage()
-    check("all cooled accounts stay put and usage reports the earliest recovery", active() === fixture.emails[0] && /所有账号额度用尽，最早恢复时间 \d{4}-/.test(cooling.error || ""))
+    check("all cooled accounts stay put and usage reports the earliest recovery", coolSettled && active() === fixture.emails[0] && /所有账号额度用尽，最早恢复时间 \d{4}-/.test(cooling.error || ""))
 
     await use("usage")
     const resetsAt = new Date(Date.now() + 30 * 60 * 1000).toISOString()
@@ -2426,21 +2580,41 @@ for (const location of ["inline", "system", "developer", "user"]) {
     await switchedPlugin.auth.usage()
     const cooldown = JSON.parse(fs.readFileSync(path.join(fixture.vaultDir, "cooldown.json"), "utf8"))[accountKey(fixture.emails[0])]
     check("98% usage records that model group's reset without switching", active() === fixture.emails[0] && cooldown.gemini === Date.parse(resetsAt) && cooldown.claude === undefined)
-    await quota("authentication fixture switches first")
-    await waitFor(() => active() === fixture.emails[1])
+    const authSwitch = await quota("authentication fixture switches first")
+    check("authentication fixture finishes switching before credential expiry", await switchSettled(authSwitch, () => active() === fixture.emails[1]))
+    const authBefore = events.length
     const authError = await send({ model, stream: false, messages: [{ role: "user", content: "AUTH_EXPIRED" }] })
     await authError.text()
-    await waitFor(() => events.some(row => row.reason === "authentication_error"))
+    const authSettled = await switchSettled(authBefore, () => events.slice(authBefore).some(row => row.reason === "authentication_error"))
     const authCooldown = JSON.parse(fs.readFileSync(path.join(fixture.vaultDir, "cooldown.json"), "utf8"))[accountKey(fixture.emails[1])]
-    check("expired target credentials are cooled for an hour without another switch", authError.status === 502 && active() === fixture.emails[1] && authCooldown?.["gemini-test"] > Date.now() + 3_500_000)
+    check("expired target credentials are cooled for an hour without another switch", authSettled && authError.status === 502 && active() === fixture.emails[1] && authCooldown?.["gemini-test"] > Date.now() + 3_500_000)
     check("expired credentials show the re-login requirement in usage", /需重新登录/.test((await switchedPlugin.auth.usage()).error || ""))
 
-    await use("wsl")
-    process.env.WSL_DISTRO_NAME = "Fixture-WSL"
-    await quota("WSL host")
-    await pause(50)
-    const wslUsage = await switchedPlugin.auth.usage()
-    check("WSL prevents switching, vault creation and reports the exact host guidance", active() === fixture.emails[0] && !fs.existsSync(fixture.vaultDir) && wslUsage.error === "插件运行在 WSL：本机 agy 启动包装每次都会按 Windows 侧账号覆盖 WSL 账号；请在 Windows 宿主上开启自动切号")
+    if (process.platform === "linux") {
+      await use("wsl")
+      process.env.WSL_DISTRO_NAME = "Fixture-WSL"
+      await quota("WSL host")
+      await pause(50)
+      const wslUsage = await switchedPlugin.auth.usage()
+      check("WSL prevents switching, vault creation and reports the exact host guidance", active() === fixture.emails[0] && !fs.existsSync(fixture.vaultDir) && wslUsage.error === "插件运行在 WSL：本机 agy 启动包装每次都会按 Windows 侧账号覆盖 WSL 账号；请在 Windows 宿主上开启自动切号")
+    } else {
+      const kit = await createBridgeKit({ platform: "linux", env: { WSL_DISTRO_NAME: "Fixture-WSL" } })
+      try {
+        const seeded = seedAccountHome(kit.home, { env: kit.env, capture: false })
+        await kit.module.AntigravityBridgePlugin({ magpie: { option: (_id, key) => key === "auto_switch" ? true : undefined } })
+        kit.defaultPrompt = async agent => {
+          const proc = [...kit.module.__agyTestAllProcs][0]
+          fs.appendFileSync(proc.logPath, "E1103 17:11:25.570096 685 errorreport.go:224] agent executor error: generating and executing: RESOURCE_EXHAUSTED (code 429): quota exhausted.\n")
+          await agent.text("\n⚠ Agent execution terminated due to error.\n")
+          return { stopReason: "end_turn" }
+        }
+        const response = await kit.request({ model, stream: false, messages: [{ role: "user", content: "QUOTA exhausted WSL host" }] })
+        const payload = await response.json()
+        check("WSL host: client keeps 429 rate_limit_error", response.status === 429 && payload.error?.type === "rate_limit_error")
+        const wslUsage = await kit.plugin.auth.usage()
+        check("WSL prevents switching, vault creation and reports the exact host guidance", JSON.parse(fs.readFileSync(seeded.accountsFile, "utf8")).active === seeded.emails[0] && !fs.existsSync(seeded.vaultDir) && wslUsage.error === "插件运行在 WSL：本机 agy 启动包装每次都会按 Windows 侧账号覆盖 WSL 账号；请在 Windows 宿主上开启自动切号")
+      } finally { await kit.dispose() }
+    }
 
     await use("legacy", false)
     const legacy = { model, messages: [{ role: "user", content: "MEMORY legacy without account" }] }
@@ -2453,10 +2627,11 @@ for (const location of ["inline", "system", "developer", "user"]) {
     await use("legacy")
     await readSSE(await send(nextTurn(legacy, legacyEvents, "MEMORY resume legacy")))
     check("old-format sessions resume on first load before any plugin switch", inits().at(-1).resumed && inits().at(-1).convId === legacySession)
-    await quota("legacy migration")
-    await waitFor(() => active() === fixture.emails[1])
+    const legacySwitch = await quota("legacy migration")
+    const legacySettled = await switchSettled(legacySwitch, () => active() === fixture.emails[1] &&
+      JSON.parse(fs.readFileSync(fixture.env.AGY_BRIDGE_STATE_FILE, "utf8")).accountSwitchOccurred === true)
     const migrated = JSON.parse(fs.readFileSync(fixture.env.AGY_BRIDGE_STATE_FILE, "utf8"))
-    check("first switch keeps version 1 and tags old entries with the source account", migrated.version === 1 && migrated.accountSwitchOccurred && migrated.entries.some(entry => entry.sessionId === "legacy-untouched") && migrated.entries.every(entry => entry.account === accountKey(fixture.emails[0])))
+    check("first switch keeps version 1 and tags old entries with the source account", legacySettled && migrated.version === 1 && migrated.accountSwitchOccurred && migrated.entries.some(entry => entry.sessionId === "legacy-untouched") && migrated.entries.every(entry => entry.account === accountKey(fixture.emails[0])))
   } finally {
     await externalLock?.release?.()
     external?.kill()
@@ -2465,6 +2640,7 @@ for (const location of ["inline", "system", "developer", "user"]) {
     fs.readdirSync = readdir
     process.stderr.write = stderrWrite
     Socket.prototype.end = socketEnd
+    restoreProcessScan()
     for (const [key, value] of Object.entries(savedEnv)) {
       if (value === undefined) delete process.env[key]
       else process.env[key] = value

@@ -5,7 +5,7 @@
 // 与 ./platform.mjs 链接到同目录的真实文件；生产文件只读，不落盘任何副本。
 // 边界替身：
 //   - node:child_process 的 spawn：`agy models` 与 `agy acp` 都换成进程内假子进程，
-//     后者讲真实 ACP JSON-RPC（initialize / session/new / set_model / prompt / cancel）。
+//     后者讲真实 ACP JSON-RPC（initialize / session/new / session/resume / set_model / prompt / cancel）。
 //     index.mjs 与 platform.mjs（spawnAgy）共用同一个假 spawn。
 //   - node:net 的 createServer：控制通道换成进程内假 socket，假 agy 经它走真实
 //     handleControlConnection → acceptMcpCall 发起 MCP 工具调用（并行调用可同步投递）。
@@ -23,7 +23,7 @@ import { EventEmitter } from "node:events"
 import { spawnSync } from "node:child_process"
 import { createRequire } from "node:module"
 import { fileURLToPath, pathToFileURL } from "node:url"
-import { captureCurrent, defaultVaultDir, tokenFileOf, accountsFileOf } from "./accounts.mjs"
+import { captureCurrent, defaultVaultDir, tokenFileOf, accountsFileOf, __setAgyProcessScannerForTests } from "./accounts.mjs"
 
 const require = createRequire(import.meta.url)
 
@@ -146,6 +146,7 @@ function createTimers() {
 
 class FakeStream extends EventEmitter {
   setEncoding() { return this }
+  destroy() { this.destroyed = true; return this }
 }
 
 class FakeChild extends EventEmitter {
@@ -261,9 +262,24 @@ class FakeAgy {
     // Optional QA protocol boundary; absent in all existing fixtures.
     if (this.kit.qaAcp?.(message, this) === true) return
     if (method === "initialize") {
-      this.respond(id, { protocolVersion: 1, agentInfo: { name: "fake-agy", version: "0.0.0-test" }, agentCapabilities: {} })
+      // 默认不声明任何能力（与旧夹具一致）；kit.agentCapabilities 可声明
+      // _meta.antigravity.systemPrompt.append 与 sessionCapabilities.resume。
+      this.respond(id, { protocolVersion: 1, agentInfo: { name: "fake-agy", version: "0.0.0-test" },
+        agentCapabilities: structuredClone(this.kit.agentCapabilities ?? {}) })
     } else if (method === "session/new") {
       this.sessionId = `fake-session-${++this.kit.sessionSerial}`
+      this.control({ kind: "list" })
+      this.respond(id, { sessionId: this.sessionId, models: { currentModelId: this.kit.initialAgyModel } })
+    } else if (method === "session/resume") {
+      // 默认恢复成功；kit.resumeBehavior(params) 可返回 { error: { code, message } } 或 { hang: true }。
+      // params（含 _meta.antigravity.systemPrompt.append）已在上面记入 kit.acpLog。
+      const behavior = this.kit.resumeBehavior?.(params) || null
+      if (behavior?.hang) return
+      if (behavior?.error) {
+        this.send({ id, error: behavior.error })
+        return
+      }
+      this.sessionId = params.sessionId
       this.control({ kind: "list" })
       this.respond(id, { sessionId: this.sessionId, models: { currentModelId: this.kit.initialAgyModel } })
     } else if (method === "session/set_model") {
@@ -404,6 +420,9 @@ export async function createBridgeKit(options = {}) {
   fs.mkdirSync(bin, { recursive: true })
   const clock = createClock(options.clockStart ?? Date.UTC(2026, 10, 4, 12, 0, 0))
   const timers = createTimers()
+  const restoreProcessScan = __setAgyProcessScannerForTests(
+    options.processScanner ?? (() => ({ procs: [], parentOf: new Map() })),
+  )
   const kit = {
     tmp,
     home,
@@ -418,6 +437,8 @@ export async function createBridgeKit(options = {}) {
     defaultPrompt: null,
     sessionSerial: 0,
     initialAgyModel: options.initialAgyModel ?? "gemini-3.8-flash-low",
+    agentCapabilities: options.agentCapabilities ?? {},
+    resumeBehavior: options.resumeBehavior ?? null,
     setModels: [],
     acpLog: [],
     controlHandler: null,
@@ -442,6 +463,7 @@ export async function createBridgeKit(options = {}) {
   const fakeProcess = new Proxy(process, {
     get(target, property) {
       if (property === "env") return kit.env
+      if (property === "platform" && options.platform) return options.platform
       const value = Reflect.get(target, property, target)
       return typeof value === "function" ? value.bind(target) : value
     },
@@ -539,12 +561,18 @@ export async function createBridgeKit(options = {}) {
     await tick()
   }
   kit.dispose = async () => {
-    Turn.prototype.registerResponse = originalRegister
-    for (const proc of [...(ns.__agyTestAllProcs || [])]) {
-      await proc.stop().catch(() => {})
+    try {
+      Turn.prototype.registerResponse = originalRegister
+      for (const proc of [...(ns.__agyTestAllProcs || [])]) {
+        await proc.stop().catch(() => {})
+      }
+      await kit.finishChildren()
+      fs.rmSync(tmp, { recursive: true, force: true })
+    } finally {
+      // Per-case QA overrides nest inside the kit's scanner; unwind in order.
+      kit.qaRestoreProcessScan?.()
+      restoreProcessScan()
     }
-    await kit.finishChildren()
-    fs.rmSync(tmp, { recursive: true, force: true })
   }
   return kit
 }
@@ -616,6 +644,18 @@ export async function readJson(response) {
 
 export function usageTotal(usage) {
   return usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens
+}
+
+/**
+ * 按 agy ACP 排他口径造一份 result.usage：inputTokens 只含未缓存输入，与缓存读、写互不包含；
+ * outputTokens 已含 thoughtTokens；totalTokens = I + R + W + O。
+ */
+export function acpUsage({ input = 0, read = 0, write = 0, output = 0, thought = 0 } = {}) {
+  const outputTokens = output + thought
+  return {
+    inputTokens: input, cachedReadTokens: read, cachedWriteTokens: write,
+    outputTokens, thoughtTokens: thought, totalTokens: input + read + write + outputTokens,
+  }
 }
 
 /** 把一次响应接成下一轮请求：追加 assistant 原样内容与对应的 tool_result。 */

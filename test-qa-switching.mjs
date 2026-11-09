@@ -10,8 +10,8 @@ import { createRequire } from "node:module"
 import { fileURLToPath } from "node:url"
 import { EventEmitter } from "node:events"
 import { test } from "node:test"
-import { accountKey, accountsFileOf, acquireSwitchLock, captureCurrent, discoverAccounts,
-  emailFromTokenPayload, tokenFileOf, vaultFileOf, writeActiveAccount } from "./accounts.mjs"
+import { __setAgyProcessScannerForTests, accountKey, accountsFileOf, acquireSwitchLock, captureCurrent, discoverAccounts,
+  emailFromTokenPayload, foreignAgyProcesses, tokenFileOf, vaultFileOf, writeActiveAccount } from "./accounts.mjs"
 import { maskEmail, maskedAccountReport, parseUsageReport } from "./usage.mjs"
 import { baseBody, createBridgeKit, readSse, seedAccountHome, tick } from "./testkit.mjs"
 
@@ -29,7 +29,9 @@ const follow = (body, parsed, text = "continue") => ({ ...body, messages: [...bo
 
 async function withKit(fn, options = {}) {
   const kit = await createBridgeKit(options)
-  try { return await fn(kit) } finally { await kit.dispose() }
+  try { return await fn(kit) } finally {
+    try { await kit.dispose() } finally { kit.qaRestoreProcessScan?.() }
+  }
 }
 
 function tempHome(t) {
@@ -48,6 +50,9 @@ function pendingAgent(kit) {
 }
 
 function installCli(kit) {
+  // accounts.mjs is host-linked by testkit, so VM fs/spawn hooks cannot
+  // isolate its OS process discovery (especially native Windows PowerShell).
+  kit.qaRestoreProcessScan ??= __setAgyProcessScannerForTests(() => ({ procs: [], parentOf: new Map() }))
   kit.qaCommands = []
   kit.qaSpawn = (file, args, _opts, makeChild) => {
     if (!["flock", "perl"].includes(file) && !args.includes("--version") && !args.includes("/usage")) return
@@ -66,12 +71,6 @@ function installCli(kit) {
       child.finish(0)
     })
     return child
-  }
-  // Deterministic process discovery: there are no external agy processes.
-  // Preserve /proc/version and all fixture file IO through the default reader.
-  kit.qaReadFile = (file, _args, readDefault) => {
-    if (/^\/proc\/\d+\/cmdline$/.test(String(file))) return Buffer.from("")
-    return readDefault()
   }
   kit.qaAcp = (message, agy) => {
     if (message.method === "initialize") {
@@ -486,6 +485,50 @@ async function loadBoundaryModule(name, home, overrides) {
   await root.evaluate()
   return root.namespace
 }
+
+test("QA process scanning: overrides share across module instances, restore OS scanning and fail closed", async t => {
+  const home = tempHome(t)
+  let scans = 0
+  const module = await loadBoundaryModule("./accounts.mjs", home, {
+    "node:child_process": { execFile(_file, _args, _options, callback) {
+      scans++
+      callback(null, { stdout: JSON.stringify({ ProcessId: 12345, ParentProcessId: 123 }), stderr: "" })
+    } },
+  })
+  const scan = () => module.foreignAgyProcesses({ platform: "win32" })
+  assert.deepEqual((await scan()).foreign, [{ pid: 12345, ppid: 123 }])
+  const restore = module.__setAgyProcessScannerForTests(() => ({ procs: [], parentOf: new Map() }))
+  try {
+    assert.deepEqual(await scan(), { ok: true, total: 0, foreign: [] })
+    const other = await loadBoundaryModule("./accounts.mjs", home, {})
+    assert.deepEqual(await other.foreignAgyProcesses({ platform: "win32" }), { ok: true, total: 0, foreign: [] })
+    assert.equal(scans, 1, "an explicit fixture must not scan the host")
+  } finally { restore() }
+  restore()
+  assert.deepEqual((await scan()).foreign, [{ pid: 12345, ppid: 123 }])
+  assert.equal(scans, 2, "disposing restores native scanning")
+  const restoreFailure = module.__setAgyProcessScannerForTests(() => { throw new Error("fixture detection failure") })
+  try {
+    assert.deepEqual(await scan(), { ok: false, reason: "detection failed: fixture detection failure" })
+  } finally { restoreFailure() }
+})
+
+test("QA process scanning: kit disposal restores the scanner after success and failure", async () => {
+  const restore = __setAgyProcessScannerForTests(() => { throw new Error("outer fixture scanner") })
+  try {
+    for (const fail of [false, true]) {
+      const run = withKit(async kit => {
+        installCli(kit)
+        installCli(kit)
+        assert.deepEqual(await foreignAgyProcesses(), { ok: true, total: 0, foreign: [] })
+        if (fail) throw new Error("fixture body failed")
+      })
+      if (fail) await assert.rejects(run, /fixture body failed/)
+      else await run
+      assert.deepEqual(await foreignAgyProcesses(), { ok: false, reason: "detection failed: outer fixture scanner" })
+    }
+  } finally { restore() }
+})
 
 test("QA locks: missing tools are distinguishable from an occupied POSIX lock", async t => {
   const home = tempHome(t)

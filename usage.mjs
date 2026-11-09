@@ -7,6 +7,7 @@ import { agySpawnSpec } from "./platform.mjs"
 const DEFAULT_TIMEOUT_MS = 15_000
 const MAX_TIMEOUT_MS = 18_000 // Magpie bounds an auth.usage call to 20 seconds.
 const MAX_OUTPUT_BYTES = 1024 * 1024
+const CLEANUP_ATTEMPTS = 8
 
 class UsageError extends Error {}
 
@@ -139,27 +140,43 @@ function run(file, args, { cwd, env, deadline, signal, maxOutputBytes, onTreeKil
     const stderr = []
     let timer
     let treeKillTimer
-    let fallbackKillTimer
+    let childExit = Promise.resolve()
     const killWindowsTree = () => {
-      let spawned = false
-      try {
-        const killer = spawn("taskkill", ["/T", "/F", "/PID", String(child.pid)], { stdio: "ignore", windowsHide: true })
-        killer?.unref?.()
-        spawned = Boolean(killer)
-        if (typeof killer?.once === "function") {
-          const done = new Promise(r => {
-            killer.once("error", () => { try { child.kill("SIGKILL") } catch {}; r() })
-            killer.once("close", code => { if (code !== 0) try { child.kill("SIGKILL") } catch {}; r() })
-          })
-          onTreeKill?.(done)
+      const killed = new Promise(resolveKill => {
+        let killTimer
+        let done = false
+        const complete = failed => {
+          if (done) return
+          done = true
+          clearTimeout(killTimer)
+          // Do not kill the root early: taskkill still needs it to discover
+          // descendants. A parent-only kill is a last resort after failure.
+          if (failed) try { child.kill("SIGKILL") } catch {}
+          resolveKill()
         }
-      } catch {}
-      if (!spawned) {
-        try { child.kill("SIGKILL") } catch {}
-      } else {
-        fallbackKillTimer = setTimeout(() => { try { child.kill("SIGKILL") } catch {} }, 500)
-        fallbackKillTimer.unref?.()
-      }
+        try {
+          const killer = spawn("taskkill", ["/T", "/F", "/PID", String(child.pid)], { stdio: "ignore", windowsHide: true })
+          killer?.unref?.()
+          if (typeof killer?.once !== "function") return complete(!killer)
+          killer.once("error", () => complete(true))
+          killer.once("close", code => complete(code !== 0))
+          killTimer = setTimeout(() => {
+            try { killer.kill?.() } catch {}
+            complete(true)
+          }, 5000)
+        } catch {
+          complete(true)
+        }
+      })
+      const done = killed.then(async () => {
+        let exitTimer
+        try {
+          await Promise.race([childExit, new Promise(resolveExit => {
+            exitTimer = setTimeout(resolveExit, 2000)
+          })])
+        } finally { clearTimeout(exitTimer) }
+      })
+      onTreeKill?.(done)
     }
     const stop = (fromExit = false) => {
       if (!child?.pid || stopped) return
@@ -190,7 +207,6 @@ function run(file, args, { cwd, env, deadline, signal, maxOutputBytes, onTreeKil
       settled = true
       clearTimeout(timer)
       clearTimeout(treeKillTimer)
-      clearTimeout(fallbackKillTimer)
       signal?.removeEventListener("abort", abort)
       if (process.platform !== "win32" || error || child?.exitCode === null) {
         stop() // Also stop MCP descendants if the parent exited first.
@@ -212,6 +228,11 @@ function run(file, args, { cwd, env, deadline, signal, maxOutputBytes, onTreeKil
         ...command.options,
         windowsHide: true,
         stdio: ["ignore", "pipe", "pipe"],
+      })
+      childExit = new Promise(resolveExit => {
+        child.once("exit", resolveExit)
+        child.once("close", resolveExit)
+        child.once("error", resolveExit)
       })
     } catch {
       finish(new UsageError("agy usage could not start the CLI."))
@@ -247,6 +268,7 @@ function supportedVersion(output) {
 export async function fetchUsage(agy, {
   env = process.env,
   timeoutMs = env.AGY_BRIDGE_USAGE_TIMEOUT_MS,
+  versionTimeoutMs = 3000,
   maxOutputBytes = MAX_OUTPUT_BYTES,
   signal,
   tempRoot = os.tmpdir(),
@@ -282,25 +304,23 @@ export async function fetchUsage(agy, {
       BROWSER: path.join(directory, process.platform === "win32" ? "open.cmd" : "open"),
     }
     const options = { cwd: directory, env: childEnv, deadline, signal, maxOutputBytes, onTreeKill: p => { pendingTreeKill = p } }
-    const version = await run(agy, ["--version"], { ...options, deadline: Math.min(deadline, Date.now() + 3000) })
+    const version = await run(agy, ["--version"], { ...options, deadline: Math.min(deadline, Date.now() + timeout(versionTimeoutMs)) })
     if (version.code !== 0) throw commandFailure(version.stderr)
     if (!supportedVersion(version.stdout)) throw new UsageError("agy usage reports require a verified agy version 1.1.11 or later. Update the CLI.")
     const result = await run(agy, ["-p", "/usage", "--output-format", "json", "--agent", "magpie-usage", "--print-timeout", `${Math.max(1, Math.ceil((deadline - Date.now()) / 1000))}s`], options)
     if (result.code !== 0) throw commandFailure(result.stderr + "\n" + result.stdout)
     return parseUsageReport(result.stdout)
   } finally {
-    for (let attempt = 0; attempt < 4; attempt++) {
+    // On Windows rejection precedes taskkill completion. Wait before touching
+    // cwd; descendants can still hold directory handles after pipes close.
+    if (pendingTreeKill) await pendingTreeKill
+    for (let attempt = 0; attempt < CLEANUP_ATTEMPTS; attempt++) {
       try {
         await fs.rm(directory, { recursive: true, force: true })
         break
       } catch (error) {
-        if (attempt === 3 || !["EBUSY", "EPERM", "ENOTEMPTY"].includes(error?.code)) break
-        if (pendingTreeKill) {
-          const waitKill = pendingTreeKill
-          pendingTreeKill = null
-          await Promise.race([waitKill, new Promise(resolve => setTimeout(resolve, 800))])
-        }
-        await new Promise(resolve => setTimeout(resolve, 50 * (attempt + 1)))
+        if (attempt === CLEANUP_ATTEMPTS - 1 || !["EBUSY", "EPERM", "ENOTEMPTY"].includes(error?.code)) break
+        await new Promise(resolve => setTimeout(resolve, 100 * (attempt + 1)))
       }
     }
   }
