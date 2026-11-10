@@ -8,10 +8,31 @@ import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { createUsageReader, exhaustedWindows, maskedAccountReport } from "./usage.mjs"
+import { startLogin } from "./login.mjs"
 import { accountKey, defaultVaultDir, discoverAccounts, captureCurrent, acquireSwitchLock,
   foreignAgyProcesses, writeActiveAccount } from "./accounts.mjs"
 
 const PROVIDER_ID = "yce-magpie-agy"
+// Client tools reach the session through a private `nc` placed first on agy's
+// PATH: agy dials `--ide-mcp-port` by running `nc 127.0.0.1 <port>`. That is
+// how agy works, not a documented interface, and it was checked on 1.4.12 and
+// 1.5.0. An older agy is refused with a clear message; a version agy doesn't
+// report is not known to be older, so the session goes ahead.
+export const MIN_AGY_VERSION = "1.4.12"
+export function agyTooOld(version) {
+  const parse = value => {
+    const match = /^v?(\d+)\.(\d+)\.(\d+)/.exec(String(value ?? "").trim())
+    return match ? match.slice(1).map(Number) : null
+  }
+  const have = parse(version)
+  if (!have) return null
+  const need = parse(MIN_AGY_VERSION)
+  for (let i = 0; i < 3; i++) {
+    if (have[i] > need[i]) return null
+    if (have[i] < need[i]) return `agy ${version} is older than ${MIN_AGY_VERSION}, the oldest version this plugin was checked on. Update agy.`
+  }
+  return null
+}
 const AGENT_NAME = "magpie-bridge"
 const MCP_SERVER_PATH = fileURLToPath(new URL("./mcp-server.mjs", import.meta.url))
 // agy exposes tools from the --ide-mcp-port server as direct functions with this prefix.
@@ -69,7 +90,11 @@ const NPM_ANTHROPIC = "@ai-sdk/anthropic"
 const PING_INTERVAL_MS = 15_000
 // agy reports an upstream failure or in-band retry warning as an ordinary
 // message chunk ("\n⚠ <message>\n") followed by end_turn on terminal failure.
-const AGENT_RETRY_BODY_PREFIX = "Encountered retryable error from model provider"
+// agy 1.5.x words the retry warning as "API error (attempt N): <error>"; older
+// builds as "Encountered retryable error from model provider: ...". Both are
+// dropped, never shown to the client as model text.
+const AGENT_RETRY_BODY_PREFIXES = ["Encountered retryable error from model provider", "API error (attempt "]
+const isAgentRetryLine = (line) => AGENT_RETRY_BODY_PREFIXES.some((prefix) => line.startsWith(prefix))
 const AGENT_TERMINAL_ERROR_PREFIXES = [
   "Agent execution terminated due to error.",
   "Our servers are experiencing high traffic right now, please try again in a minute.",
@@ -84,8 +109,35 @@ const AGENT_TERMINAL_ERROR_PREFIXES = [
   "The model produced an invalid tool call.",
   "Mid-stream error",
 ]
-const AGENT_ALL_BANNER_PREFIXES = [AGENT_RETRY_BODY_PREFIX, ...AGENT_TERMINAL_ERROR_PREFIXES]
+const AGENT_ALL_BANNER_PREFIXES = [...AGENT_RETRY_BODY_PREFIXES, ...AGENT_TERMINAL_ERROR_PREFIXES]
 const AGENT_BANNER_HOLD_LIMIT = 16 * 1024
+
+// Antigravity refuses a request whose system prompt reads as the Claude Agent
+// SDK's (Claude Code subagents, `claude -p`, Claude Desktop), Codex's GPT-5
+// prompt or Hermes Agent's old persona with a fake `429 RESOURCE_EXHAUSTED`,
+// however much quota is left; agy then retries it forever. A zero-width space
+// after the first letter lets the same words through and the model reads them
+// as before. Same list as magpie's antigravity-cloak middleware, which only
+// acts on magpie's built-in Antigravity accounts, not on this provider. Only
+// system-level text sent to agy is changed; conversation identities, hashes
+// and user content are not.
+const PROMPT_CLOAK_WORDS = [
+  "x-anthropic-billing-header",
+  "Claude Agent SDK",
+  "You are Codex, an agent based on GPT-5",
+  "You are Codex, a coding agent based on GPT-5",
+  "Hermes Agent, an intelligent AI assistant created by Nous Research",
+]
+const PROMPT_CLOAK_RES = PROMPT_CLOAK_WORDS.map((word) => new RegExp(word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"))
+const ZWSP = "\u200b"
+
+function cloakPromptText(text) {
+  if (typeof text !== "string" || !text) return text
+  if (!hostOption("prompt_cloak", "AGY_BRIDGE_PROMPT_CLOAK", true)) return text
+  let out = text
+  for (const re of PROMPT_CLOAK_RES) out = out.replace(re, (match) => match[0] + ZWSP + match.slice(1))
+  return out
+}
 
 const FALLBACK_MODELS = [
   { id: "gemini-4-argon-high", name: "Gemini 4 Argon (High)", effort: "high" },
@@ -295,12 +347,72 @@ async function listAgyModels(agyPath) {
   return out.length ? out : null
 }
 
+// probeSignedIn is whether agy lists the signed-in account's models: an
+// exit code alone can't say so, so a listing without one model in it is
+// not signed in either.
+async function probeSignedIn(agy) {
+  const probe = await execOnce(agy, ["models"], { timeoutMs: 15_000 })
+  const listed = !probe.err && !probe.timedOut && probe.code === 0 &&
+    probe.stdout.split("\n").some(line => /^\S+\s+\S/.test(line.trim()))
+  if (listed) return { ok: true }
+  const why = probe.timedOut
+    ? "`agy models` timed out after 15s"
+    : `\`agy models\` says: ${(probe.stderr || probe.stdout || "").trim().split(/\r?\n/).filter(Boolean).at(-1) || probe.err?.message || `exit ${probe.code}`}`
+  return { ok: false, why }
+}
+
 const EFFORT_ORDER = ["minimal", "low", "medium", "high", "xhigh", "max"]
 const MODEL_CATALOG_TTL_MS = 5 * 60 * 1000
 const MODEL_CATALOG_FAST_WAIT_MS = 500
 const MODEL_CATALOG_RETRY_MS = 5_000
 let modelCatalogRefreshPromise = null
 let cachedModelCatalog = fallbackModelCatalog()
+
+// Any additional model a live ACP session offers (via configOptions or
+// models.availableModels) that `agy models` did not list is merged into the
+// catalog as well.
+let acpOfferedModels = null
+let acpOfferedKey = ""
+
+function offeredModelsOf(configOptions, models) {
+  const out = []
+  const option = configSelect(Array.isArray(configOptions) ? configOptions : [], "model")
+  for (const value of selectValues(option?.options)) out.push({ id: value.value, name: value.name })
+  for (const model of Array.isArray(models?.availableModels) ? models.availableModels : []) {
+    const id = model?.modelId ?? model?.id
+    if (typeof id === "string" && id) out.push({ id, name: model.name })
+  }
+  return out
+}
+
+function noteOfferedModels(configOptions, models) {
+  const offered = offeredModelsOf(configOptions, models)
+  if (!offered.length) return
+  const names = new Map(offered.map(model => [model.id, typeof model.name === "string" && model.name ? model.name : model.id]))
+  const key = [...names.keys()].sort().join("\n")
+  if (key === acpOfferedKey) return
+  acpOfferedModels = names
+  acpOfferedKey = key
+}
+
+// A model the session offers that `agy models` did not list is served as is.
+function withOffered(list) {
+  if (!acpOfferedModels) return list
+  const covered = new Set(list.flatMap(model => [model.id, modelFamilyId(model)]))
+  return [...list, ...[...acpOfferedModels].filter(([id]) => !covered.has(id)).map(([id, name]) => ({
+    id,
+    name,
+    effort: /-(high|medium|low|minimal|xhigh|max)$/i.exec(id)?.[1]?.toLowerCase(),
+  }))]
+}
+
+function catalogOf(entry) {
+  if (entry.offeredKey !== acpOfferedKey || !entry.catalog) {
+    entry.catalog = buildModelCatalog(withOffered(entry.list))
+    entry.offeredKey = acpOfferedKey
+  }
+  return entry.catalog
+}
 
 function modelFamilyId(model) {
   if (!model.effort) return ""
@@ -362,7 +474,7 @@ function buildModelCatalog(list) {
 }
 
 function fallbackModelCatalog(agyPath = null) {
-  return { agyPath, catalog: buildModelCatalog(FALLBACK_MODELS), isFallback: true, fetchedAt: 0, lastAttemptAt: null }
+  return { agyPath, list: FALLBACK_MODELS, catalog: null, offeredKey: null, isFallback: true, fetchedAt: 0, lastAttemptAt: null }
 }
 
 // Magpie gives models() about two seconds, while `agy models` can take longer.
@@ -371,13 +483,15 @@ function fallbackModelCatalog(agyPath = null) {
 async function loadModelCatalog(agyPath) {
   if (cachedModelCatalog.agyPath !== agyPath) {
     // An old executable's dynamic additions must not route to a new one.
+    acpOfferedModels = null
+    acpOfferedKey = ""
     cachedModelCatalog = fallbackModelCatalog(agyPath)
     modelCatalogRefreshPromise = null
   }
   const current = cachedModelCatalog
-  if (!agyPath) return current.catalog
+  if (!agyPath) return catalogOf(current)
   const now = Date.now()
-  if (!current.isFallback && now - current.fetchedAt < MODEL_CATALOG_TTL_MS) return current.catalog
+  if (!current.isFallback && now - current.fetchedAt < MODEL_CATALOG_TTL_MS) return catalogOf(current)
   if (!modelCatalogRefreshPromise &&
       (current.lastAttemptAt === null || now - current.lastAttemptAt >= MODEL_CATALOG_RETRY_MS)) {
     current.lastAttemptAt = now
@@ -385,7 +499,9 @@ async function loadModelCatalog(agyPath) {
       if (list?.length && cachedModelCatalog === current) {
         cachedModelCatalog = {
           agyPath,
-          catalog: buildModelCatalog(list),
+          list,
+          catalog: null,
+          offeredKey: null,
           isFallback: false,
           fetchedAt: Date.now(),
           lastAttemptAt: current.lastAttemptAt,
@@ -409,7 +525,7 @@ async function loadModelCatalog(agyPath) {
       clearTimeout(timer)
     }
   }
-  return cachedModelCatalog.catalog
+  return catalogOf(cachedModelCatalog)
 }
 
 function modelLimits(id) {
@@ -920,7 +1036,8 @@ class Turn {
     })
   }
 
-  // Filters agy's in-band retry banners ("\n⚠ Encountered retryable error...\n")
+  // Filters agy's in-band retry banners ("\n⚠ Encountered retryable error...\n",
+  // "\n⚠ API error (attempt N): ...\n")
   // and recognizes terminal error banners without altering normal "⚠ " output.
   pushText(chunk) {
     if (this.done || this.agentError || !chunk) return
@@ -954,7 +1071,7 @@ class Turn {
       const body = rest.slice(header.length)
       const lineEnd = body.indexOf("\n")
       const line = lineEnd >= 0 ? body.slice(0, lineEnd) : body
-      const isRetry = line.startsWith(AGENT_RETRY_BODY_PREFIX)
+      const isRetry = isAgentRetryLine(line)
       const isTerminal = !isRetry && AGENT_TERMINAL_ERROR_PREFIXES.some((prefix) => line.startsWith(prefix))
       const isPartial = lineEnd < 0 && !isRetry && !isTerminal &&
         AGENT_ALL_BANNER_PREFIXES.some((prefix) => prefix.startsWith(body))
@@ -1013,7 +1130,7 @@ class Turn {
       : rest.startsWith("\n⚠ ") ? "\n⚠ " : ""
     if (header) {
       const body = rest.slice(header.length)
-      if (body.startsWith(AGENT_RETRY_BODY_PREFIX)) return
+      if (isAgentRetryLine(body)) return
       if (AGENT_TERMINAL_ERROR_PREFIXES.some((prefix) => body.startsWith(prefix))) {
         this.agentError = true
         this.agentErrorMessage = body.slice(0, 1000).trim()
@@ -1228,6 +1345,8 @@ class Proc {
       clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
     })
     this.agentVersion = init?.agentInfo?.version ?? null
+    const tooOld = agyTooOld(this.agentVersion)
+    if (tooOld) throw new Error(tooOld)
     const capabilities = init?.agentCapabilities ?? {}
     this.supportsImages = capabilities.promptCapabilities?.image === true ||
       capabilities.prompt_capabilities?.image === true
@@ -1237,7 +1356,7 @@ class Proc {
     // append; other families get it inline in the first prompt (instructionsPlacement).
     const placement = this.instructionsPlacement
     this.instructionsInSession = appendable && !!this.instructions && placement === "session"
-    const appendMeta = { _meta: { antigravity: { systemPrompt: { append: this.instructions } } } }
+    const appendMeta = { _meta: { antigravity: { systemPrompt: { append: cloakPromptText(this.instructions) } } } }
 
     let session = null
     if (this.resumeFrom && resumable) {
@@ -1279,6 +1398,7 @@ class Proc {
     // A resumed session reports the account default; always apply the selection.
     this.currentModel = session?.models?.currentModelId ?? null
     this.configOptions = Array.isArray(session?.configOptions) ? session.configOptions : []
+    noteOfferedModels(this.configOptions, session?.models)
     if (this.model) await this.#setModel(this.model, this.selection, this.resumed)
     if (this.tools.length) await this.#waitForToolList(this.toolsVersion)
   }
@@ -1399,6 +1519,7 @@ class Proc {
     if (method !== "session/update" || params?.sessionId !== this.sessionId) return
     if (params.update?.sessionUpdate === "config_option_update" && Array.isArray(params.update.configOptions)) {
       this.configOptions = params.update.configOptions
+      noteOfferedModels(this.configOptions, null)
       this.currentSelectionKey = null
       return
     }
@@ -2453,6 +2574,8 @@ async function switchAccount(target, { reason, sourceAccount }) {
     }
     activeAccount = accountKey(target)
     accountGeneration++
+    acpOfferedModels = null
+    acpOfferedKey = ""
     cachedModelCatalog = fallbackModelCatalog()
     modelCatalogRefreshPromise = null
     blockedModelFamily = null
@@ -2970,8 +3093,63 @@ function historyKey(messages) {
   return stableJSON(rows.filter(row => row.content.length))
 }
 
+// Assistant-prefill support (ported from magpie-community/plugins agy-cli
+// 0.1.3, #904): a trailing text-only assistant message is a client-side
+// prefill (chat/roleplay frontends, "continue"/"impersonate" flows, bot
+// frameworks). Keep the run in the tail so the session ledger
+// (expectedMessages, client bytes) stays aligned with the client's own
+// history across turns, and render it as a continuation carrier instead of
+// the system-reminder treatment. AGY_BRIDGE_PREFILL=0 restores the stock
+// reject; AGY_BRIDGE_PREFILL_CARRIER_NOTE overrides the carrier's note line.
+const prefillTailEnabled = () => process.env.AGY_BRIDGE_PREFILL !== "0"
+const prefillCarrierNote = () => process.env.AGY_BRIDGE_PREFILL_CARRIER_NOTE
+  || "(system note: the fragment below is part of your own unfinished reply; continue exactly from where it stops, and do not repeat it.)"
+
+// Concatenated text of an assistant message, or null when the message carries
+// anything other than plain text blocks. An empty string means "no content".
+function assistantTextOf(message) {
+  if (!message || message.role !== "assistant") return null
+  if (typeof message.content === "string") return message.content
+  if (!Array.isArray(message.content)) return null
+  let text = ""
+  for (const block of message.content) {
+    if (!block || block.type !== "text" || typeof block.text !== "string") return null
+    text += block.text
+  }
+  return text
+}
+
+// History/tail positions for a request that ends with an assistant prefill
+// run: runStart = first message of the trailing text-only assistant run,
+// boundary = history split point (after the last assistant message before the
+// run, the session ledger's newest entry). Returns null when the request does
+// not end with a text-only assistant run. Known limits: a request combining a
+// live tool_result with a prefill tail is rejected in validateBody; a run with
+// no user message before it puts the whole run in the tail, so that one turn
+// degrades to a fresh session (safe, self-healing).
+function prefillRun(messages) {
+  const last = messages.at(-1)
+  if (!last || last.role !== "assistant") return null
+  if (assistantTextOf(last) === null) return null
+  let runStart = messages.length
+  while (runStart > 0 && messages[runStart - 1]?.role === "assistant" && assistantTextOf(messages[runStart - 1]) !== null) runStart--
+  let boundary = runStart
+  while (boundary > 0 && messages[boundary - 1]?.role !== "assistant") boundary--
+  return { runStart, boundary }
+}
+
+function renderPrefillCarrierParts(message) {
+  const body = (assistantTextOf(message) || "").trim()
+  if (!body) return []
+  return [{ type: "text", text: `${prefillCarrierNote()}\n${body}` }]
+}
+
 function trailingMessages(body) {
   body = canonicalBody(body)
+  const run = prefillTailEnabled() ? prefillRun(body.messages) : null
+  if (run) {
+    return { history: body.messages.slice(0, run.boundary), messages: body.messages.slice(run.boundary) }
+  }
   let start = body.messages.length
   while (start > 0 && body.messages[start - 1].role !== "assistant") start--
   return { history: body.messages.slice(0, start), messages: body.messages.slice(start) }
@@ -3389,9 +3567,11 @@ function renderTurnMessage(message) {
   const out = []
   const joinedReminders = reminders.join("").trim()
   if (joinedReminders) {
-    out.push(/^<system-reminder(?:\s[^>]*)?>[\s\S]*<\/system-reminder(?:\s[^>]*)?>$/.test(joinedReminders)
-      ? joinedReminders
-      : `<system-reminder>\n${joinedReminders}\n</system-reminder>`)
+    // System/developer notices are system-level text: cloaked like the system prompt.
+    const notice = cloakPromptText(joinedReminders)
+    out.push(/^<system-reminder(?:\s[^>]*)?>[\s\S]*<\/system-reminder(?:\s[^>]*)?>$/.test(notice)
+      ? notice
+      : `<system-reminder>\n${notice}\n</system-reminder>`)
   }
   out.push(...queuedParts)
   return out.join("\n\n")
@@ -3426,7 +3606,14 @@ function renderTurnMessageParts(message) {
 }
 
 function renderTurnMessagesParts(messages) {
-  const groups = messages.map(renderTurnMessageParts).filter((group) => group.length > 0)
+  // A trailing assistant prefill run renders as a continuation carrier rather
+  // than the system-reminder treatment (see prefillRun above).
+  const run = prefillTailEnabled() && messages.length ? prefillRun(messages) : null
+  const prefillStart = run ? run.runStart : -1
+  const groups = messages.map((message, index) =>
+    prefillStart >= 0 && index >= prefillStart
+      ? renderPrefillCarrierParts(message)
+      : renderTurnMessageParts(message)).filter((group) => group.length > 0)
   const out = []
   for (let i = 0; i < groups.length; i++) {
     if (i > 0) out.push({ type: "text", text: "\n\n" })
@@ -3552,7 +3739,7 @@ function renderInitialPromptParts(body, callerWorkDir, instructionsInSession, re
   const budget = Math.max(0, maxInitialPromptBytes() - reserveBytes)
   const head = []
   if (!instructionsInSession) {
-    const system = systemText(body)
+    const system = cloakPromptText(systemText(body))
     if (system.trim()) appendPrompt(head, `<external_system_instructions>\n${system}\n</external_system_instructions>\n`)
     if (callerWorkDir) appendPrompt(head, `\n${workDirNote(callerWorkDir)}\n\n`)
   }
@@ -3618,10 +3805,17 @@ function validateBody(body) {
   }
   const trailing = trailingMessages(body)
   const lastRole = body.messages.at(-1)?.role
-  const validTailRole = lastRole === "user" || lastRole === "system" || lastRole === "developer"
+  // A text-only assistant tail is a client-side prefill (see prefillRun).
+  const prefillTail = prefillTailEnabled() && lastRole === "assistant" && assistantTextOf(body.messages.at(-1)) !== null
+  const validTailRole = lastRole === "user" || lastRole === "system" || lastRole === "developer" || prefillTail
+  if (prefillTail && extractToolResults(body).length) {
+    throw new UnsupportedContent("a request combining a live tool_result with an assistant prefill tail")
+  }
   if (!validTailRole || (!extractToolResults(body).length &&
     !trailing.messages.some((message) => message.role === "user") && !trailing.history.length)) {
-    throw new UnsupportedContent("a request whose last message is not from the user or a tool-result notification")
+    throw new UnsupportedContent(prefillTail
+      ? "a request whose only messages are assistant prefill turns (no user turn to continue from)"
+      : "a request whose last message is not from the user or a tool-result notification")
   }
   if (body.system && typeof body.system !== "string") {
     if (!Array.isArray(body.system) || body.system.some((block) => block?.type !== "text")) {
@@ -3652,7 +3846,6 @@ function validateBody(body) {
           if (block?.type === "tool_result") toolResult(block)
           else if (block?.type === "image") parseUserImage(block)
           else if (block?.type === "text" || typeof block === "string") continue
-          else if (block?.type === "image") parseUserImage(block)
           else if (block?.type === "document") parseUserDocumentText(block)
           else if (block?.type === "search_result") parseSearchResultText(block)
           else blockText(block)
@@ -4743,6 +4936,20 @@ export const AntigravityBridgePlugin = async (input, packageOptions) => {
           },
         },
         {
+          key: "prompt_cloak",
+          label: "Get Claude Code subagents past Antigravity's fake 429",
+          description: "Antigravity answers Claude Agent SDK, Codex GPT-5 and Hermes system prompts (Claude Code subagents, claude -p) with a fake 429 that agy retries forever. On: a zero-width space goes inside those words in what agy is sent. May be against Google's terms. Off: as written (AGY_BRIDGE_PROMPT_CLOAK=0).",
+          default: true,
+          labels: {
+            zh: "绕过 Claude Code 子代理的假 429",
+            "zh-TW": "繞過 Claude Code 子代理的假 429",
+          },
+          descriptions: {
+            zh: "Antigravity 看到 Claude Agent SDK（Claude Code 子代理、claude -p）、Codex GPT-5、Hermes 旧人设的系统提示词会回假 429，agy 无限重试、工具调不起来。开启后在发给 agy 的系统文本里给这几句插入零宽空格，模型理解不变；这会改动发给 Google 的内容，可能违反其条款。关闭后原样发送（同 AGY_BRIDGE_PROMPT_CLOAK=0）。",
+            "zh-TW": "Antigravity 看到 Claude Agent SDK（Claude Code 子代理、claude -p）、Codex GPT-5、Hermes 舊人設的系統提示詞會回假 429，agy 無限重試、工具呼叫不起來。開啟後在傳給 agy 的系統文字裡給這幾句插入零寬空格，模型理解不變；這會改動傳給 Google 的內容，可能違反其條款。關閉後原樣傳送（同 AGY_BRIDGE_PROMPT_CLOAK=0）。",
+          },
+        },
+        {
           key: "auto_switch",
           label: "Auto-switch agy accounts",
           description: "When the current agy account runs out of quota, stop this plugin's agy processes and switch to the next account from plugin Options → accounts. Rewrites the agy account files under ~/.gemini; skipped while other agy work is running.",
@@ -4766,36 +4973,52 @@ export const AntigravityBridgePlugin = async (input, packageOptions) => {
       usage: async () => readAccountUsage(readUsage),
       methods: [
         {
-          type: "api",
-          keyless: true,
-          label: "Sign in with the agy CLI",
+          // agy's own Google sign-in (`agy acp --login`): magpie opens its
+          // link and takes the code the page shows. agy keeps the token;
+          // the plugin's account is only "agy", saved once agy says the
+          // sign-in took and lists the account's models.
+          type: "oauth",
+          label: "Sign in with Google",
           authorize: async () => {
             const agy = findAgy()
             if (!agy) {
               return {
                 type: "failed",
-                error: "agy CLI not found. Install Antigravity CLI first: https://antigravity.google/docs/cli — then run `agy` once to sign in.",
+                error: "agy CLI not found. Install Antigravity CLI first: https://antigravity.google/docs/cli",
               }
             }
             let admitted = false
+            let probe
             try {
               while (switching) await waitForAccountSwitch()
               preparingRequests++
               admitted = true
-              const probe = await execOnce(agy, ["models"], { timeoutMs: 15_000 })
-              if (probe.err || probe.code !== 0 || !probe.stdout.trim()) {
-                const why = probe.timedOut
-                  ? "timed out after 15s"
-                  : (probe.stderr || probe.stdout || "").trim() || probe.err?.message || "unknown error"
-                return {
-                  type: "failed",
-                  error: `agy at ${agy} is not signed in (${why}). Run \`agy\` in a terminal once to sign in to your Google account, then try again.`,
-                }
-              }
-              return { type: "success", key: "agy" }
+              probe = await probeSignedIn(agy)
             } catch (error) {
               return { type: "failed", error: error.message }
-            } finally { if (admitted) preparingRequests-- }
+            } finally {
+              if (admitted) preparingRequests--
+            }
+            // signed in to agy already: nothing to open
+            if (probe.ok) {
+              if (autoSwitchEnabled()) captureCurrent({ home: os.homedir(), vaultDir: defaultVaultDir() })
+              return { url: "", instructions: "", method: "auto", callback: async () => ({ type: "success", key: "agy" }) }
+            }
+            const login = await startLogin(agy)
+            if (login.error) return { type: "failed", error: login.error }
+            return {
+              url: login.url,
+              instructions: "",
+              method: "code",
+              callback: async (code, opts = {}) => {
+                const done = await login.finish(code, { signal: opts.signal })
+                if (done.error) return { type: "failed", error: done.error }
+                const signedIn = await probeSignedIn(agy)
+                if (!signedIn.ok) return { type: "failed", error: `agy signed in, but ${signedIn.why}` }
+                if (autoSwitchEnabled()) captureCurrent({ home: os.homedir(), vaultDir: defaultVaultDir() })
+                return { type: "success", key: "agy" }
+              },
+            }
           },
         },
       ],

@@ -31,15 +31,24 @@ GPT-OSS 模型，请求实际由 `agy` 进程完成。
   就用 `session/resume` 接上上下文。状态文件只存会话 ID 与哈希，不存消息原文。
 - **隔离运行**：不读取你的全局 MCP 配置。每个 agy 进程使用临时 agent。agy 发起的权限
   请求（shell、写文件、浏览器等）一律拒绝，真正的操作都在客户端侧完成。
+- **Magpie 内直接登录 Google 账号**：在 Magpie 的 Providers 页点击 `Sign in with Google`，
+  本机已登录时直接通过；未登录时由 `agy acp --login` 给出 Google 授权链接并在页面内回填授权码，
+  在服务器或 Docker 里跑 Magpie 也无需远程桌面（对齐官方 agy-cli 0.1.1）。
 - **额度查看**：在 Magpie 里查看 agy 订阅的用量窗口，仅作展示，额度耗尽时不会自动拦截请求。
+- **Claude Code 子代理可用**：Antigravity 对 Claude Agent SDK 身份的系统提示词（Claude Code
+  子代理、`claude -p`、Claude Desktop）回假 429，插件默认在发给 agy 的系统级文本里绕开，
+  见下文「Claude Code 子代理与假 429」。
+- **助手预填**：以纯文本 assistant 消息结尾的请求（SillyTavern 预填、「继续写」、bot 框架）
+  不再 400 拒绝，预填留在本轮并渲染为续写提示，会话跨轮保持对齐（移植自官方
+  agy-cli 0.1.3）。
 - **多账号自动切号**：当前 agy 账号额度用尽时，插件自动停掉自有 agy 进程，把本机 agy 切到
   下一个已采集备份的账号继续服务。默认关闭，在 Providers 页开启；同一时间只用一个账号，
   详见下文「多账号自动切号」。
 
 ## 环境要求
 
-- Antigravity CLI（`agy`），带 `acp` 子命令，并且在终端里交互登录过一次 Google 账号。
-  文本与工具调用已在 1.4.12 和 1.5.0 上验证；图片输入需要 1.5.0。
+- Antigravity CLI（`agy`），带 `acp` 子命令。文本与工具调用已在 1.4.12 和 1.5.0 上验证（握手时拒绝低于 1.4.12 的版本）；
+  从 Magpie 页面直接发起 Google 登录（`agy acp --login`）与图片输入需要 1.5.0。
 - 支持 OpenCode 风格 provider 插件的 Magpie。额度查询已在 Magpie 0.1.1599 上验证。
 - agy 版本低于 1.1.11 时，额度查询会被拒绝，以免旧版本把 `/usage` 当成模型提示词。
 
@@ -68,9 +77,10 @@ magpie plugin add ./yce-magpie-agy
 
 ## 使用
 
-1. 在 Magpie 的 Providers 页找到 `yce-magpie-agy` 并点击 Sign in。插件会用 `agy models`
-   确认 CLI 可用。Google 凭据始终由 agy 自己保管，插件默认不读取、不保存；只有开启
-   「多账号自动切号」后，插件才会读取并备份令牌文件（见下文）。
+1. 在 Magpie 的 Providers 页找到 `yce-magpie-agy` 并点击 **Sign in with Google**。插件先用
+   `agy models` 检查是否已登录：若本机 agy 已登录则直接完成；若未登录则启动 `agy acp --login`，
+   在页面里打开 Google 登录链接并粘贴授权码（或跳转后的完整 URL）即可完成登录。Google 凭据始终
+   由 agy 自己保管，插件默认不读取、不保存；只有开启「多账号自动切号」后，插件才会读取并备份令牌文件（见下文）。
 2. 模型名写成 `yce-magpie-agy/<模型>`。agy 对同一模型不同思考等级给出的多个模型 ID，
    在这里会合并成一个模型的多个变体，请求时再映射回对应的 agy ID。
 3. 在客户端里选用这个模型即可。
@@ -133,17 +143,21 @@ magpie quota refresh yce-magpie-agy --json
 | `AGY_BRIDGE_MAX_PROMPT_BYTES` | 114688（112 KiB） | 重放历史提示词的字节预算 |
 | `AGY_BRIDGE_USAGE_TIMEOUT_MS` | 15000 | 额度查询的总时间预算，最高 18000 |
 | `AGY_BRIDGE_MCP_TRACE` | 未设置 | 把 MCP 通道流量写入指定文件，仅用于排查 |
+| `AGY_BRIDGE_PROMPT_CLOAK` | 开启 | 设为 `0` 关闭假 429 绕过，系统提示词原样发给 agy；新版 Magpie 以 Providers 页开关为准 |
+| `AGY_BRIDGE_PREFILL` | 开启 | 设为 `0` 恢复对 assistant 预填尾巴的 400 拒绝 |
+| `AGY_BRIDGE_PREFILL_CARRIER_NOTE` | 英文提示行 | 预填片段渲染时的提示行文本（发给模型） |
 
 ## 插件选项
 
 新版 Magpie 提供两个配置入口，生效方式不同：
 
-- **Providers 页开关**（即时生效）：在 Magpie 的 Providers 页对本提供商可切换三个布尔开关，宿主每次调用现读，改动立即对后续请求生效，无需重启：
+- **Providers 页开关**（即时生效）：在 Magpie 的 Providers 页对本提供商可切换四个布尔开关，宿主每次调用现读，改动立即对后续请求生效，无需重启：
 
   | 开关 | 默认 | 作用 |
   |---|---|---|
   | `thinking_summary` | 开 | 转发 agy 思考摘要。关闭后响应不再携带 `thinking` 块，等价于旧版设置 `AGY_BRIDGE_THINKING=0` |
   | `minimal_agent` | 开 | 以最小隔离 agent 运行 agy。关闭后保留 agy 默认提示组件，每次模型调用多约 2,600 个输入 token；只对新启动的 agy 进程生效，开关变化后下一次请求会按既有不兼容路径换新进程 |
+  | `prompt_cloak` | 开 | 绕过 Antigravity 对 Claude Agent SDK 等身份句的假 429，见下文「Claude Code 子代理与假 429」。关闭后系统提示词原样发送，等价于 `AGY_BRIDGE_PROMPT_CLOAK=0` |
   | `auto_switch` | 关 | 当前 agy 账号额度用尽时，自动切到下一个已采集账号：停掉插件自有 agy 进程、改写 `~/.gemini` 下的账号文件、换号后继续服务。同一时间只用一个账号；完整行为、前提与限制见下文「多账号自动切号」 |
 
   旧宿主（没有 Providers 页开关的 Magpie）不读这些开关，仍按上表环境变量与默认值工作。
@@ -166,6 +180,32 @@ magpie quota refresh yce-magpie-agy --json
   - `idleMs` / `resumeTtlMs`：进程空闲回收、停车会话可续接的时长（毫秒）；优先级高于 `AGY_BRIDGE_IDLE_MS` / `AGY_BRIDGE_RESUME_TTL_MS`。
   - 各键优先级一律是 JSON > 对应环境变量 > 默认值；非法值会让插件加载直接失败并写明键名，空串与 `null` 视为未设置。
   - 命令行同样可写：`magpie plugin options yce-magpie-agy '{"maxProcs":8}'`，`magpie plugin options yce-magpie-agy off` 清除。
+
+## Claude Code 子代理与假 429
+
+Antigravity 看到下面这些系统提示词片段时，不管额度还剩多少都回
+`429 RESOURCE_EXHAUSTED: Resource has been exhausted`，agy 收到后按退避一直重试，客户端
+表现为卡住、一个工具都调不起来：
+
+- `You are a Claude agent, built on Anthropic's Claude Agent SDK`：Claude Code 的子代理
+  （Agent 工具）、`claude -p` 非交互模式、Claude Desktop 都用这句；
+- `x-anthropic-billing-header`（Claude Code 的计费行）、Codex 给 GPT-5 的身份句、
+  Hermes Agent 旧版默认人设。
+
+Claude Code 交互主会话用的是另一句身份，所以「主会话能跑 Bash，子代理和 `claude -p` 卡死」
+就是这个原因。2026-11-10 在本机 agy 1.5.1 上实测：同一请求去掉这句即正常调用 Bash，
+保留则一直 429。
+
+插件默认在**发给 agy 的系统级文本**（会话级 append、内联的 `external_system_instructions`、
+`role: system/developer` 消息）里，给这几句的首字母后插一个零宽空格（U+200B），模型读到的
+意思不变。词表与 magpie 的 antigravity-cloak 中间件相同——那个中间件只作用于 magpie 自带的
+Antigravity 账号，管不到本插件。会话标识、续接哈希与用户正文都不改。
+
+这会改动发给 Google 的内容，可能违反 Antigravity 条款。不想要就在 Providers 页关掉
+`prompt_cloak`（旧宿主设 `AGY_BRIDGE_PROMPT_CLOAK=0`）。
+
+另外，agy 1.5.x 把重试提示改成了 `⚠ API error (attempt N): …`，插件同样把它过滤掉，
+不会再当成模型回复显示在客户端里。
 
 ## 多账号自动切号
 
@@ -235,6 +275,9 @@ magpie quota refresh yce-magpie-agy --json
   从 agy 的日志中取出真实原因，并以错误结束本轮，不会当作正常回复输出。
 - **HTTP 409，提示工具结果与历史对不上**：通常是客户端在对话中途改写了历史或工具 ID。
   能确定对应关系时插件会重建会话；无法确定时直接拒绝，不做猜测。
+- **Claude Code 子代理或 `claude -p` 一直卡住、工具调不起来，agy 日志里反复
+  `RESOURCE_EXHAUSTED (code 429)`**：多半是假 429，确认 Providers 页 `prompt_cloak` 开着，
+  见「Claude Code 子代理与假 429」。
 - **想关掉思考摘要**：新版 Magpie 在 Providers 页关闭（旧宿主仍可用 `AGY_BRIDGE_THINKING=0`），或者在请求里带上
   `thinking: { "type": "disabled" }`。
 

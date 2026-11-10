@@ -165,12 +165,12 @@ function followUp(body, parsed, userText) {
 
 const hasThinking = (parsed) => parsed.content.some((block) => block.type === "thinking")
 
-test("auth.options 声明三个开关且符合 Magpie 约束", async () => {
+test("auth.options 声明四个开关且符合 Magpie 约束", async () => {
   await withKit({}, async (kit) => {
     const options = kit.plugin.auth.options
     assert.ok(Array.isArray(options), "auth.options 应为数组")
-    assert.equal(options.length, 3)
-    assert.deepEqual(options.map((option) => option.key), ["thinking_summary", "minimal_agent", "auto_switch"])
+    assert.equal(options.length, 4)
+    assert.deepEqual(options.map((option) => option.key), ["thinking_summary", "minimal_agent", "prompt_cloak", "auto_switch"])
     for (const option of options) {
       assert.match(option.key, /^[a-z0-9_-]{1,40}$/)
       assert.equal(typeof option.label, "string")

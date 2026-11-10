@@ -1,6 +1,6 @@
 {
   "name": "@magpie-community/yce-magpie-agy",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Magpie/OpenCode model provider that connects your local agy CLI through the Agent Client Protocol (agy acp), so Antigravity subscription models run through the real CLI",
   "type": "module",
   "main": "./index.mjs",
@@ -14,6 +14,7 @@
     "platform.mjs",
     "mcp-server.mjs",
     "usage.mjs",
+    "login.mjs",
     "accounts.mjs",
     "README.md",
     "README.en.md",
@@ -21,7 +22,7 @@
     "NOTICE.md"
   ],
   "scripts": {
-    "test": "node --experimental-vm-modules --test test-usage.mjs test-compat.mjs test-platform.mjs test-catalog.mjs test-usage-settlement.mjs test-usage-floor.mjs test-repeat-batch.mjs test-options.mjs test-accounts.mjs test-qa-switching.mjs test-cache-stats.mjs && node test-smoke.mjs",
+    "test": "node --experimental-vm-modules --test test-usage.mjs test-compat.mjs test-platform.mjs test-catalog.mjs test-usage-settlement.mjs test-usage-floor.mjs test-repeat-batch.mjs test-options.mjs test-accounts.mjs test-qa-switching.mjs test-cache-stats.mjs test-cloak.mjs test-prefill.mjs && node test-smoke.mjs",
     "test:integration": "node test-integration.mjs"
   },
   "keywords": [

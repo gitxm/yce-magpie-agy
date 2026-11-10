@@ -76,6 +76,36 @@ test("首次快速成功时直接拿到动态目录", async () => {
   })
 })
 
+test("会话额外开放但 agy models 未列出的型号也会并入目录", async () => {
+  await withKit({ modelsBehavior: DYNAMIC_OK, offeredModels: [
+    ["gemini-4-argon-high", "Gemini 4 Argon (High)"],
+    ["offered-only", "Offered Only"],
+  ] }, async (kit) => {
+    kit.defaultPrompt = async (agent) => {
+      await agent.text("ok")
+      return { stopReason: "end_turn", usage: { inputTokens: 10, outputTokens: 1 } }
+    }
+    const parsed = await readSse(await kit.request(baseBody({ model: "yce-magpie-agy/gemini-4-argon", tools: [], messages: [{ role: "user", content: "hi" }] })))
+    assert.equal(parsed.error, null, JSON.stringify(parsed.error))
+    const after = await kit.models()
+    assert.ok(after["offered-only"], "会话开放而 agy models 没列的型号应并入目录")
+    assert.ok(after["claude-opus-5-5"], "默认目录里的非 Gemini 家族仍保留")
+  })
+})
+
+test("握手报出的 agy 版本低于 1.4.12 时拒绝会话并说明原因", async () => {
+  await withKit({ agentVersion: "1.4.11" }, async (kit) => {
+    kit.defaultPrompt = async (agent) => {
+      await agent.text("ok")
+      return { stopReason: "end_turn" }
+    }
+    const response = await kit.request(baseBody({ model: "yce-magpie-agy/gemini-4-argon", tools: [], messages: [{ role: "user", content: "hi" }] }))
+    const text = response.status === 200 ? JSON.stringify((await readSse(response)).error) : await response.text()
+    assert.match(text, /agy 1\.4\.11 is older than 1\.4\.12/)
+    assert.equal(kit.acpLog.filter(entry => entry.method === "session/new").length, 0, "旧版本不应开会话")
+  })
+})
+
 test("新鲜缓存不再等待也不再 spawn", async () => {
   await withKit({ modelsBehavior: DYNAMIC_OK }, async (kit) => {
     await kit.models()

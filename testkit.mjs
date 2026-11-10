@@ -32,6 +32,7 @@ export const REPO_DIR = path.dirname(fileURLToPath(import.meta.url))
 export const INDEX_FILE = process.env.AGY_BRIDGE_TEST_INDEX || path.join(REPO_DIR, "index.mjs")
 export const USAGE_FILE = path.join(REPO_DIR, "usage.mjs")
 export const PLATFORM_FILE = path.join(REPO_DIR, "platform.mjs")
+export const LOGIN_FILE = path.join(REPO_DIR, "login.mjs")
 export const ACCOUNTS_FILE = path.join(REPO_DIR, "accounts.mjs")
 export const MESSAGES_URL = "agy://local/v1/messages"
 export const COUNT_TOKENS_URL = "agy://local/v1/messages/count_tokens"
@@ -264,12 +265,14 @@ class FakeAgy {
     if (method === "initialize") {
       // 默认不声明任何能力（与旧夹具一致）；kit.agentCapabilities 可声明
       // _meta.antigravity.systemPrompt.append 与 sessionCapabilities.resume。
-      this.respond(id, { protocolVersion: 1, agentInfo: { name: "fake-agy", version: "0.0.0-test" },
+      this.respond(id, { protocolVersion: 1, agentInfo: { name: "fake-agy", version: this.kit.agentVersion },
         agentCapabilities: structuredClone(this.kit.agentCapabilities ?? {}) })
     } else if (method === "session/new") {
       this.sessionId = `fake-session-${++this.kit.sessionSerial}`
       this.control({ kind: "list" })
-      this.respond(id, { sessionId: this.sessionId, models: { currentModelId: this.kit.initialAgyModel } })
+      const models = { currentModelId: this.kit.initialAgyModel }
+      if (this.kit.offeredModels) models.availableModels = this.kit.offeredModels.map(([modelId, name]) => ({ modelId, name }))
+      this.respond(id, { sessionId: this.sessionId, models })
     } else if (method === "session/resume") {
       // 默认恢复成功；kit.resumeBehavior(params) 可返回 { error: { code, message } } 或 { hang: true }。
       // params（含 _meta.antigravity.systemPrompt.append）已在上面记入 kit.acpLog。
@@ -437,6 +440,8 @@ export async function createBridgeKit(options = {}) {
     defaultPrompt: null,
     sessionSerial: 0,
     initialAgyModel: options.initialAgyModel ?? "gemini-3.8-flash-low",
+    offeredModels: options.offeredModels ?? null,
+    agentVersion: options.agentVersion ?? "1.5.0",
     agentCapabilities: options.agentCapabilities ?? {},
     resumeBehavior: options.resumeBehavior ?? null,
     setModels: [],
@@ -526,6 +531,7 @@ export async function createBridgeKit(options = {}) {
     let module
     if (key === "./usage.mjs") module = sourceModule(USAGE_FILE, "", usageUrl)
     else if (key === "./platform.mjs") module = sourceModule(PLATFORM_FILE, "", platformUrl)
+    else if (key === "./login.mjs") module = sourceModule(LOGIN_FILE, "", pathToFileURL(LOGIN_FILE).href)
     else if (key === "./accounts.mjs") module = sourceModule(ACCOUNTS_FILE, "", pathToFileURL(ACCOUNTS_FILE).href)
     else if (key.startsWith("node:")) module = builtinModule(key, overrides[key])
     else throw new Error(`testkit: 未登记的依赖 ${specifier}`)

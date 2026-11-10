@@ -1,3 +1,29 @@
+## 2026-11-10：Claude Code 子代理调不起工具（假 429）与 agy 1.5.x 重试横幅（v0.2.3）
+
+- **根因（实测）**：Antigravity 对系统提示词里的 `You are a Claude agent, built on
+  Anthropic's Claude Agent SDK`（Claude Code 子代理、`claude -p`、Claude Desktop 都带）回假
+  `429 RESOURCE_EXHAUSTED`，agy 无限退避重试，客户端卡死、工具一个都调不起来。交互主会话
+  身份句不同，所以主会话能跑 Bash。抓 Claude Code 真实请求逐项删减重放确认：去掉 system 或
+  只插零宽空格即正常出 Bash tool_use。magpie 的 antigravity-cloak 中间件只作用于内置
+  Antigravity 账号，管不到本插件。
+- **修复**：`cloakPromptText` 在出站系统级文本（会话 append、内联
+  `external_system_instructions`、system/developer 消息）给 cloak 中间件同一份词表的首字母后
+  插 U+200B；会话键、续接哈希、用户正文不改。Providers 页新开关 `prompt_cloak`（默认开），
+  旧宿主 `AGY_BRIDGE_PROMPT_CLOAK=0` 关闭。
+- **顺带（对齐官方 `agy-cli` 0.1.0–0.1.3 能力）**：
+  - agy 1.5.x 重试横幅改为 `⚠ API error (attempt N): …`，旧过滤认不出、会当正文漏给客户端；
+    `AGENT_RETRY_BODY_PREFIXES` 两种都认。
+  - 移植官方 `agy-cli` 0.1.3 的助手预填（#904，`trailingMessages` / `renderPrefillCarrierParts` / `prefill_tail` 开关）。
+  - 移植官方 `agy-cli` 0.1.1 的 `login.mjs`（`agy acp --login`）：`auth.methods[0]` 改为
+    `type: "oauth"`（`Sign in with Google`），已登录时免开链接直接通过，未登录时在 Magpie
+    内打开授权链接并回填 code/URL 完成登录，开启自动切号时顺手备份当前账号。
+  - 对齐官方 `agy-cli` 0.1.0/0.1.2 的 ACP 握手最低版本检查（`MIN_AGY_VERSION = "1.4.12"`，
+    `agyTooOld`）与会话级额外开放模型并入目录（`noteOfferedModels` + `withOffered`，保留
+    `clientInfo: { name: "zed" }` 全家族直出）。
+- **验证**：`npm test` 204 tests + 362 smoke checks 全绿；新用例在旧 index 上 4 项失败。真实
+  agy（WSL 1.5.4、gemini-3.8-flash）用抓到的子代理请求：新代码 11 秒出 Bash tool_use，旧代码
+  60 秒仍在 429 重试并漏出横幅。已装到 Magpie 的插件需更新后才生效。
+
 ## 2026-11-06：多账号自动切号与插件选项
 
 本段记录当日第二轮改动（版本升至 0.2.0）；建仓与 provider ID 事项见下一段。

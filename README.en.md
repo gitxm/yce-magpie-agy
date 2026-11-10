@@ -45,6 +45,11 @@ response.
 - **Isolation**: your global MCP configuration is never read. Every agy process
   runs with a temporary agent, and every permission request agy raises (shell,
   file edits, browser) is refused. Real actions happen on the client side.
+- **Sign in with Google inside Magpie**: click `Sign in with Google` on the
+  Providers page. If `agy` is already signed in, nothing opens; otherwise `agy acp --login`
+  prints the Google OAuth link and takes the authorization code (or callback URL)
+  right in Magpie, so headless servers and Docker work too (aligned with official
+  `agy-cli` 0.1.1).
 - **Usage visibility**: Magpie shows the agy subscription usage windows. They are
   informational only; running out of quota does not block requests automatically.
 - **Multi-account auto-switching**: when the current agy account runs out of
@@ -54,9 +59,9 @@ response.
 
 ## Requirements
 
-- The Antigravity CLI (`agy`) with the `acp` subcommand, signed in to a Google
-  account at least once from an interactive terminal. Text and tool calls have
-  been verified on 1.4.12 and 1.5.0; image input needs 1.5.0.
+- The Antigravity CLI (`agy`) with the `acp` subcommand. Text and tool calls have
+  been verified on 1.4.12 and 1.5.0 (the ACP handshake rejects versions older than
+  1.4.12); signing in from Magpie (`agy acp --login`) and image input need 1.5.0.
 - A Magpie build with OpenCode-style provider plugin support. Usage reporting was
   verified on Magpie 0.1.1599.
 - agy versions older than 1.1.11 are refused for usage queries, because those
@@ -87,9 +92,11 @@ After installing, run `agy` once in a terminal to complete the Google sign-in.
 
 ## Usage
 
-1. Open Magpie's Providers page, find `yce-magpie-agy`, and click Sign in. The
-   plugin uses `agy models` to confirm the CLI works. Google credentials stay
-   with agy; the plugin does not read or store them unless multi-account
+1. Open Magpie's Providers page, find `yce-magpie-agy`, and click **Sign in with Google**.
+   The plugin first checks `agy models`: if `agy` is already signed in, it succeeds
+   immediately; if not, it runs `agy acp --login`, opens Google's sign-in link, and
+   accepts the authorization code (or full callback URL) in Magpie. Google credentials
+   stay with agy; the plugin does not read or store them unless multi-account
    auto-switching is enabled (see below).
 2. Refer to models as `yce-magpie-agy/<model>`. When agy lists separate model IDs
    for different thinking levels, they are grouped here as variants of one model,
@@ -169,13 +176,40 @@ measurable data shows "Limits not available" rather than a fake 0% or 100%.
 | `AGY_BRIDGE_MAX_PROMPT_BYTES` | 114688 (112 KiB) | Byte budget for the replayed history prompt |
 | `AGY_BRIDGE_USAGE_TIMEOUT_MS` | 15000 | Total time budget for a usage query, capped at 18000 |
 | `AGY_BRIDGE_MCP_TRACE` | unset | Writes MCP channel traffic to the given file; for debugging only |
+| `AGY_BRIDGE_PROMPT_CLOAK` | on | `0` sends the system prompt to agy as written (no fake-429 workaround); new Magpie uses the Providers-page switch |
+| `AGY_BRIDGE_PREFILL` | on | `0` brings back the 400 for a request ending in an assistant prefill |
+| `AGY_BRIDGE_PREFILL_CARRIER_NOTE` | English note | The note line sent to the model before a prefill fragment |
+
+## Claude Code subagents and the fake 429
+
+Antigravity answers a system prompt containing `You are a Claude agent, built on
+Anthropic's Claude Agent SDK` (Claude Code subagents, `claude -p`, Claude
+Desktop), `x-anthropic-billing-header`, Codex's GPT-5 identity lines or Hermes
+Agent's old persona with `429 RESOURCE_EXHAUSTED`, however much quota is left;
+agy retries it with backoff and the client hangs without a single tool call.
+The interactive Claude Code main session uses a different identity, which is
+why the main session can run Bash while subagents and `claude -p` cannot
+(verified on agy 1.5.1, 2026-11-10).
+
+By default the bridge puts a zero-width space (U+200B) after the first letter
+of those words in the system-level text it sends to agy (session append, inline
+`external_system_instructions`, `system`/`developer` messages). The word list is
+the one magpie's antigravity-cloak middleware uses; that middleware acts only on
+magpie's built-in Antigravity accounts, not on this provider. Conversation keys,
+resume hashes and user content are unchanged. This changes what Google is sent
+and may be against its terms: turn off `prompt_cloak` on the Providers page (old
+hosts: `AGY_BRIDGE_PROMPT_CLOAK=0`) to send prompts as written.
+
+agy 1.5.x words its retry notice as `⚠ API error (attempt N): …`; the bridge
+filters it like the older `Encountered retryable error` banner instead of
+showing it as model text.
 
 ## Plugin options
 
 New Magpie builds offer two configuration entry points that take effect
 differently:
 
-- **Providers-page switches** (immediate): three boolean switches for this
+- **Providers-page switches** (immediate): four boolean switches for this
   provider on Magpie's Providers page; the host re-reads them on every call,
   so a flip applies to the next request without restarting:
 
@@ -183,6 +217,7 @@ differently:
   |---|---|---|
   | `thinking_summary` | on | Forward agy thought summaries. Off: responses carry no `thinking` blocks, same as `AGY_BRIDGE_THINKING=0` |
   | `minimal_agent` | on | Run agy with a minimal isolated agent. Off keeps agy's default prompt components, costing about 2,600 more input tokens per model call; applies to newly started agy processes, and the next request swaps an incompatible process through the existing retire path |
+  | `prompt_cloak` | on | Get past Antigravity's fake 429 for Claude Agent SDK and similar identity lines; see "Claude Code subagents and the fake 429". Off: same as `AGY_BRIDGE_PROMPT_CLOAK=0` |
   | `auto_switch` | off | When the current agy account runs out of quota, switch to the next captured account: stop the plugin's own agy processes, rewrite the account files under `~/.gemini`, and keep serving. One account at a time; see "Multi-account auto-switching" below for the full behavior, prerequisites and limits |
 
   Older hosts without these switches keep using the environment variables
