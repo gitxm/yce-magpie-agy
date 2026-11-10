@@ -144,6 +144,7 @@ magpie quota refresh yce-magpie-agy --json
 | `AGY_BRIDGE_USAGE_TIMEOUT_MS` | 15000 | 额度查询的总时间预算，最高 18000 |
 | `AGY_BRIDGE_MCP_TRACE` | 未设置 | 把 MCP 通道流量写入指定文件，仅用于排查 |
 | `AGY_BRIDGE_PROMPT_CLOAK` | 开启 | 设为 `0` 关闭假 429 绕过，系统提示词原样发给 agy；新版 Magpie 以 Providers 页开关为准 |
+| `AGY_BRIDGE_EXTRA_CLOAK_WORDS` | 未设置 | 追加需要插入零宽空格的系统提示词敏感词（逗号分隔或 JSON 数组） |
 | `AGY_BRIDGE_PREFILL` | 开启 | 设为 `0` 恢复对 assistant 预填尾巴的 400 拒绝 |
 | `AGY_BRIDGE_PREFILL_CARRIER_NOTE` | 英文提示行 | 预填片段渲染时的提示行文本（发给模型） |
 
@@ -170,7 +171,8 @@ magpie quota refresh yce-magpie-agy --json
     "maxProcs": 16,
     "accounts": [],
     "idleMs": 600000,
-    "resumeTtlMs": 21600000
+    "resumeTtlMs": 21600000,
+    "extraWords": []
   }
   ```
 
@@ -178,6 +180,7 @@ magpie quota refresh yce-magpie-agy --json
   - `maxProcs`：进程池上限，1-64 的整数；建议与 Providers 页该提供商的 Concurrency 保持一致，否则多出的请求会排队或 503；优先级高于 `AGY_BRIDGE_MAX_PROCS`。
   - `accounts`：参与自动切号的账号邮箱数组，按顺序轮转；留空时按 `~/.gemini/google_accounts.json` 的 active+old 自动发现。数组里没有令牌备份的账号会被跳过（见「多账号自动切号」）。
   - `idleMs` / `resumeTtlMs`：进程空闲回收、停车会话可续接的时长（毫秒）；优先级高于 `AGY_BRIDGE_IDLE_MS` / `AGY_BRIDGE_RESUME_TTL_MS`。
+  - `extraWords`：额外需要在系统提示词里插入零宽空格的敏感词数组（每项至少 2 个字符），与已安装的 `@magpie-community/middleware-antigravity-cloak` 词表及 `AGY_BRIDGE_EXTRA_CLOAK_WORDS` 自动合并。
   - 各键优先级一律是 JSON > 对应环境变量 > 默认值；非法值会让插件加载直接失败并写明键名，空串与 `null` 视为未设置。
   - 命令行同样可写：`magpie plugin options yce-magpie-agy '{"maxProcs":8}'`，`magpie plugin options yce-magpie-agy off` 清除。
 

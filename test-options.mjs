@@ -90,6 +90,8 @@ test("非法 Options 值在初始化时抛错并写明键名", async () => {
     await assert.rejects(applyOptions(kit, { idleMs: "x" }), /idleMs/)
     await assert.rejects(applyOptions(kit, { resumeTtlMs: -1 }), /resumeTtlMs/)
     await assert.rejects(applyOptions(kit, { agyPath: 42 }), /agyPath/)
+    await assert.rejects(applyOptions(kit, { extraWords: "not-an-array" }), /extraWords/)
+    await assert.rejects(applyOptions(kit, { extraWords: ["a"] }), /extraWords/)
   })
 })
 

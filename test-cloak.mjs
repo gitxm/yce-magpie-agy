@@ -7,6 +7,8 @@
 
 import { test } from "node:test"
 import assert from "node:assert/strict"
+import fs from "node:fs"
+import path from "node:path"
 import { baseBody, createBridgeKit, readSse } from "./testkit.mjs"
 
 const ZWSP = "\u200b"
@@ -151,5 +153,49 @@ test("agy 1.5.x 的 \"⚠ API error (attempt N)\" 重试横幅被过滤，不进
     const text = parsed.content.filter((block) => block.type === "text").map((block) => block.text).join("")
     assert.ok(!text.includes("API error"), `重试横幅不应漏给客户端：${JSON.stringify(text)}`)
     assert.equal(text.trim(), "final answer")
+  })
+})
+
+test("自动同步已安装的 middleware-antigravity-cloak 新增词表与 plugins.json extraWords", async () => {
+  await withKit({}, async (kit) => {
+    plainAgent(kit)
+    kit.agentCapabilities = appendCapable
+    const mwDir = path.join(kit.home, ".config", "magpie", "plugins", "node_modules", "@magpie-community", "middleware-antigravity-cloak")
+    fs.mkdirSync(mwDir, { recursive: true })
+    fs.writeFileSync(
+      path.join(mwDir, "antigravity-cloak.middleware.js"),
+      'export const words = ["x-anthropic-billing-header", "Future Upstream Agent Phrase"]\n',
+    )
+    fs.writeFileSync(
+      path.join(kit.home, ".config", "magpie", "plugins.json"),
+      JSON.stringify({
+        plugins: [
+          {
+            spec: "@magpie-community/middleware-antigravity-cloak@latest",
+            options: { extraWords: ["Shared Middleware Extra"] },
+          },
+        ],
+      }),
+    )
+    await kit.module.AntigravityBridgePlugin(undefined, { extraWords: ["Plugin Option Phrase"] })
+    const system = "You are Future Upstream Agent Phrase with Shared Middleware Extra and Plugin Option Phrase."
+    const parsed = await readSse(await kit.request(baseBody({ system, metadata: { user_id: "cloak-sync" } })))
+    assert.equal(parsed.stopReason, "end_turn")
+    const append = appendedInstructions(kit)
+    assert.ok(append.includes(`F${ZWSP}uture Upstream Agent Phrase`), "应自动合并 middleware-antigravity-cloak 的新增词")
+    assert.ok(append.includes(`S${ZWSP}hared Middleware Extra`), "应自动合并 middleware-antigravity-cloak 的 extraWords")
+    assert.ok(append.includes(`P${ZWSP}lugin Option Phrase`), "应合并本插件 Options 的 extraWords")
+  })
+})
+
+test("环境变量 AGY_BRIDGE_EXTRA_CLOAK_WORDS 支持逗号分隔或 JSON 数组", async () => {
+  await withKit({ env: { AGY_BRIDGE_EXTRA_CLOAK_WORDS: "EnvCustomAlpha, EnvCustomBeta" } }, async (kit) => {
+    plainAgent(kit)
+    kit.agentCapabilities = appendCapable
+    const system = "System with EnvCustomAlpha and EnvCustomBeta."
+    await readSse(await kit.request(baseBody({ system, metadata: { user_id: "cloak-env-extra" } })))
+    const append = appendedInstructions(kit)
+    assert.ok(append.includes(`E${ZWSP}nvCustomAlpha`))
+    assert.ok(append.includes(`E${ZWSP}nvCustomBeta`))
   })
 })

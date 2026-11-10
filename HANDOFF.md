@@ -1,4 +1,4 @@
-## 2026-11-10：Claude Code 子代理调不起工具（假 429）与 agy 1.5.x 重试横幅（v0.2.3）
+## 2026-11-10：Claude Code 子代理调不起工具（假 429）与 agy 1.5.x 重试横幅（v0.2.3–v0.2.4）
 
 - **根因（实测）**：Antigravity 对系统提示词里的 `You are a Claude agent, built on
   Anthropic's Claude Agent SDK`（Claude Code 子代理、`claude -p`、Claude Desktop 都带）回假
@@ -9,7 +9,9 @@
 - **修复**：`cloakPromptText` 在出站系统级文本（会话 append、内联
   `external_system_instructions`、system/developer 消息）给 cloak 中间件同一份词表的首字母后
   插 U+200B；会话键、续接哈希、用户正文不改。Providers 页新开关 `prompt_cloak`（默认开），
-  旧宿主 `AGY_BRIDGE_PROMPT_CLOAK=0` 关闭。
+  旧宿主 `AGY_BRIDGE_PROMPT_CLOAK=0` 关闭。`v0.2.4` 起自动读取已安装的
+  `@magpie-community/middleware-antigravity-cloak` 导出词表与 `plugins.json` 里的
+  `extraWords`，并支持本插件 Options 的 `extraWords` 与 `AGY_BRIDGE_EXTRA_CLOAK_WORDS`。
 - **顺带（对齐官方 `agy-cli` 0.1.0–0.1.3 能力）**：
   - agy 1.5.x 重试横幅改为 `⚠ API error (attempt N): …`，旧过滤认不出、会当正文漏给客户端；
     `AGENT_RETRY_BODY_PREFIXES` 两种都认。

@@ -117,25 +117,116 @@ const AGENT_BANNER_HOLD_LIMIT = 16 * 1024
 // prompt or Hermes Agent's old persona with a fake `429 RESOURCE_EXHAUSTED`,
 // however much quota is left; agy then retries it forever. A zero-width space
 // after the first letter lets the same words through and the model reads them
-// as before. Same list as magpie's antigravity-cloak middleware, which only
-// acts on magpie's built-in Antigravity accounts, not on this provider. Only
-// system-level text sent to agy is changed; conversation identities, hashes
-// and user content are not.
-const PROMPT_CLOAK_WORDS = [
+// as before. Starts from the built-in list, automatically merges any new words
+// exported by an installed @magpie-community/middleware-antigravity-cloak (and
+// its extraWords in Magpie's plugins.json), and accepts plugin Options
+// extraWords / AGY_BRIDGE_EXTRA_CLOAK_WORDS. Only system-level text sent to agy
+// is changed; conversation identities, hashes and user content are not.
+const DEFAULT_PROMPT_CLOAK_WORDS = [
   "x-anthropic-billing-header",
   "Claude Agent SDK",
   "You are Codex, an agent based on GPT-5",
   "You are Codex, a coding agent based on GPT-5",
   "Hermes Agent, an intelligent AI assistant created by Nous Research",
 ]
-const PROMPT_CLOAK_RES = PROMPT_CLOAK_WORDS.map((word) => new RegExp(word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"))
+const SIBLING_CLOAK_MIDDLEWARE = fileURLToPath(
+  new URL("../middleware-antigravity-cloak/antigravity-cloak.middleware.js", import.meta.url),
+)
 const ZWSP = "\u200b"
+
+let cachedMiddlewareKey = null
+let cachedMiddlewareWords = []
+let cachedCloakKey = ""
+let cachedCloakRes = []
+
+function validCloakWord(word) {
+  return typeof word === "string" && word.trim().length > 1
+}
+
+function readInstalledCloakWords() {
+  const out = []
+  const add = (word) => {
+    if (validCloakWord(word) && !out.includes(word)) out.push(word)
+  }
+  const home = os.homedir()
+  const candidates = [
+    process.env.AGY_BRIDGE_CLOAK_MIDDLEWARE_PATH,
+    SIBLING_CLOAK_MIDDLEWARE,
+    path.join(home, ".config", "magpie", "plugins", "node_modules", "@magpie-community", "middleware-antigravity-cloak", "antigravity-cloak.middleware.js"),
+  ].filter(Boolean)
+  let foundFile = null
+  for (const file of candidates) {
+    try {
+      const source = fs.readFileSync(file, "utf8")
+      foundFile = file
+      const match = /export\s+const\s+words\s*=\s*(\[[\s\S]*?\])/.exec(source)
+      if (!match) continue
+      const parsed = JSON.parse(match[1])
+      if (Array.isArray(parsed)) for (const word of parsed) add(word)
+      break
+    } catch {}
+  }
+  const pluginConfigCandidates = [
+    foundFile ? path.resolve(path.dirname(foundFile), "..", "..", "..", "..", "plugins.json") : null,
+    path.join(home, ".config", "magpie", "plugins.json"),
+  ].filter(Boolean)
+  for (const configFile of pluginConfigCandidates) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(configFile, "utf8"))
+      if (!Array.isArray(parsed?.plugins)) continue
+      for (const entry of parsed.plugins) {
+        if (typeof entry?.spec === "string" && entry.spec.includes("middleware-antigravity-cloak") &&
+            Array.isArray(entry.options?.extraWords)) {
+          for (const word of entry.options.extraWords) add(word)
+        }
+      }
+      break
+    } catch {}
+  }
+  return out
+}
+
+function envExtraCloakWords() {
+  const raw = process.env.AGY_BRIDGE_EXTRA_CLOAK_WORDS
+  if (typeof raw !== "string" || !raw.trim()) return []
+  const trimmed = raw.trim()
+  if (trimmed.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(trimmed)
+      if (Array.isArray(parsed)) return parsed.filter(validCloakWord)
+    } catch {}
+  }
+  return trimmed.split(/[\r\n,]+/).map((word) => word.trim()).filter(validCloakWord)
+}
+
+function promptCloakRegexes() {
+  const middlewareKey = `${process.env.AGY_BRIDGE_CLOAK_MIDDLEWARE_PATH || ""}\n${os.homedir()}`
+  if (cachedMiddlewareKey !== middlewareKey) {
+    cachedMiddlewareKey = middlewareKey
+    cachedMiddlewareWords = readInstalledCloakWords()
+  }
+  const merged = []
+  for (const word of [
+    ...DEFAULT_PROMPT_CLOAK_WORDS,
+    ...cachedMiddlewareWords,
+    ...(packageConfig.extraWords || []),
+    ...envExtraCloakWords(),
+  ]) {
+    if (validCloakWord(word) && !merged.includes(word)) merged.push(word)
+  }
+  const key = merged.join("\n")
+  if (key !== cachedCloakKey) {
+    cachedCloakKey = key
+    cachedCloakRes = merged.map((word) => new RegExp(word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"))
+  }
+  return cachedCloakRes
+}
 
 function cloakPromptText(text) {
   if (typeof text !== "string" || !text) return text
   if (!hostOption("prompt_cloak", "AGY_BRIDGE_PROMPT_CLOAK", true)) return text
   let out = text
-  for (const re of PROMPT_CLOAK_RES) out = out.replace(re, (match) => match[0] + ZWSP + match.slice(1))
+  for (const re of promptCloakRegexes()) out = out.replace(re, (match) => match[0] + ZWSP + match.slice(1))
   return out
 }
 
@@ -183,10 +274,10 @@ function configuredTimeout(name, fallback) {
 // plugin load with the key name instead of silently falling back; unknown keys
 // are ignored with a bridge event. Null and "" count as unset, so the matching
 // environment variable (and then the default) applies.
-const PACKAGE_OPTION_KEYS = new Set(["agyPath", "maxProcs", "accounts", "idleMs", "resumeTtlMs"])
+const PACKAGE_OPTION_KEYS = new Set(["agyPath", "maxProcs", "accounts", "idleMs", "resumeTtlMs", "extraWords"])
 
 function emptyPackageConfig() {
-  return { agyPath: null, maxProcs: null, accounts: [], idleMs: null, resumeTtlMs: null }
+  return { agyPath: null, maxProcs: null, accounts: [], idleMs: null, resumeTtlMs: null, extraWords: [] }
 }
 
 let hostInput = null
@@ -250,6 +341,16 @@ function validatePackageOptions(options) {
         if (!accounts.includes(account)) accounts.push(account)
       }
       config.accounts = accounts
+    } else if (key === "extraWords") {
+      if (!Array.isArray(value)) throw invalidOptionError(key, "expected an array of strings (at least 2 characters each)")
+      const words = []
+      for (const word of value) {
+        if (!validCloakWord(word)) {
+          throw invalidOptionError(key, `expected strings of at least 2 characters, got ${JSON.stringify(word)}`)
+        }
+        if (!words.includes(word)) words.push(word)
+      }
+      config.extraWords = words
     }
   }
   if (unknown.length) logBridgeEvent(null, null, "plugin_options", "ignored_unknown_keys", {}, { keys: unknown.join(",") })
@@ -259,6 +360,7 @@ function validatePackageOptions(options) {
 function applyPluginConfig(input, options) {
   hostInput = input ?? null
   packageConfig = validatePackageOptions(options)
+  cachedMiddlewareKey = null
 }
 
 function findAgy() {

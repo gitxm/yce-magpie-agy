@@ -177,6 +177,7 @@ measurable data shows "Limits not available" rather than a fake 0% or 100%.
 | `AGY_BRIDGE_USAGE_TIMEOUT_MS` | 15000 | Total time budget for a usage query, capped at 18000 |
 | `AGY_BRIDGE_MCP_TRACE` | unset | Writes MCP channel traffic to the given file; for debugging only |
 | `AGY_BRIDGE_PROMPT_CLOAK` | on | `0` sends the system prompt to agy as written (no fake-429 workaround); new Magpie uses the Providers-page switch |
+| `AGY_BRIDGE_EXTRA_CLOAK_WORDS` | unset | Extra system-prompt words to break with a zero-width space (comma-separated or JSON array) |
 | `AGY_BRIDGE_PREFILL` | on | `0` brings back the 400 for a request ending in an assistant prefill |
 | `AGY_BRIDGE_PREFILL_CARRIER_NOTE` | English note | The note line sent to the model before a prefill fragment |
 
@@ -233,7 +234,8 @@ differently:
     "maxProcs": 16,
     "accounts": [],
     "idleMs": 600000,
-    "resumeTtlMs": 21600000
+    "resumeTtlMs": 21600000,
+    "extraWords": []
   }
   ```
 
@@ -248,6 +250,10 @@ differently:
     auto-switching").
   - `idleMs` / `resumeTtlMs`: idle reclaim and parked-session resume windows
     in milliseconds; override `AGY_BRIDGE_IDLE_MS` / `AGY_BRIDGE_RESUME_TTL_MS`.
+  - `extraWords`: extra system-prompt words to break with a zero-width space
+    (strings of at least 2 characters), merged automatically with any words
+    exported by an installed `@magpie-community/middleware-antigravity-cloak`
+    and `AGY_BRIDGE_EXTRA_CLOAK_WORDS`.
   - Priority for every key is JSON > matching environment variable > default;
     an invalid value fails the plugin load naming the key, and empty strings
     and `null` count as unset.

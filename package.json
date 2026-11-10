@@ -1,6 +1,6 @@
 {
   "name": "@magpie-community/yce-magpie-agy",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Magpie/OpenCode model provider that connects your local agy CLI through the Agent Client Protocol (agy acp), so Antigravity subscription models run through the real CLI",
   "type": "module",
   "main": "./index.mjs",
@@ -43,7 +43,8 @@
       "maxProcs": 16,
       "accounts": [],
       "idleMs": 600000,
-      "resumeTtlMs": 21600000
+      "resumeTtlMs": 21600000,
+      "extraWords": []
     }
   },
   "engines": {
