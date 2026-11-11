@@ -2,6 +2,7 @@
 import assert from "node:assert/strict"
 import { EventEmitter } from "node:events"
 import fs from "node:fs"
+import { createRequire } from "node:module"
 import path from "node:path"
 import { test } from "node:test"
 import {
@@ -396,4 +397,327 @@ test("cache stats: count_tokens ignores tool-level cache_control", () => withKit
   const plain = await kit.countTokens(baseBody({ tools: [TOOL] }))
   const hinted = await kit.countTokens(baseBody({ tools: [HINTED_TOOL] }))
   assert.equal(hinted, plain)
+}))
+
+const testRequire = createRequire(import.meta.url)
+
+function openTestSqlite(file) {
+  if (typeof globalThis.Bun !== "undefined") {
+    const { Database } = testRequire("bun:sqlite")
+    const db = new Database(file, { create: true })
+    db.exec("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS gen_metadata (idx INTEGER, data BLOB, size INTEGER);")
+    const insert = db.prepare("INSERT INTO gen_metadata (idx, data, size) VALUES (?, ?, ?)")
+    return {
+      write(idx, blob) { insert.run(idx, blob, blob.byteLength) },
+      close() { insert.finalize(); db.close(false) },
+    }
+  }
+  const { DatabaseSync } = process.getBuiltinModule?.("node:sqlite") ?? testRequire("node:sqlite")
+  const db = new DatabaseSync(file)
+  db.exec("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS gen_metadata (idx INTEGER, data BLOB, size INTEGER);")
+  const insert = db.prepare("INSERT INTO gen_metadata (idx, data, size) VALUES (?, ?, ?)")
+  return {
+    write(idx, blob) { insert.run(idx, blob, blob.byteLength) },
+    close() { db.close() },
+  }
+}
+
+function encodeVarint(value) {
+  let big = typeof value === "bigint" ? BigInt.asUintN(64, value) : BigInt(value)
+  const out = []
+  while (big >= 0x80n) {
+    out.push(Number(big & 0x7fn) | 0x80)
+    big >>= 7n
+  }
+  out.push(Number(big))
+  return Buffer.from(out)
+}
+
+function protoVarintField(field, value) {
+  return Buffer.concat([encodeVarint((BigInt(field) << 3n) | 0n), encodeVarint(value)])
+}
+
+function protoBytesField(field, payload) {
+  return Buffer.concat([encodeVarint((BigInt(field) << 3n) | 2n), encodeVarint(payload.length), payload])
+}
+
+function encodeGenMetadataBlob({ model = 1007, input = 0, output = 0, write = 0, read = 0, thinking = 0, response = 0, withNegativeSibling = false } = {}) {
+  const statsParts = [protoVarintField(1, model)]
+  if (input > 0) statsParts.push(protoVarintField(2, input))
+  if (output > 0) statsParts.push(protoVarintField(3, output))
+  if (write > 0) statsParts.push(protoVarintField(4, write))
+  if (read > 0) statsParts.push(protoVarintField(5, read))
+  if (thinking > 0) statsParts.push(protoVarintField(9, thinking))
+  if (response > 0) statsParts.push(protoVarintField(10, response))
+  const innerParts = [protoBytesField(4, Buffer.concat(statsParts))]
+  if (withNegativeSibling) {
+    // Real agy gen_metadata embeds 10-byte -1 varints in sibling submessages (e.g. 1.9.2).
+    innerParts.push(protoBytesField(9, protoVarintField(2, -1n)))
+  }
+  return protoBytesField(1, Buffer.concat(innerParts))
+}
+
+function conversationsPath(kit, sessionId) {
+  const dir = kit.env.AGY_BRIDGE_CONVERSATIONS_DIR || path.join(kit.home, ".gemini", "antigravity-cli", "conversations")
+  fs.mkdirSync(dir, { recursive: true })
+  return path.join(dir, `${sessionId}.db`)
+}
+
+test("cache stats: cold multi-step tool loop reads exact per-step cache hits from SQLite gen_metadata", () => withKit(async (kit) => {
+  let writer = null
+  let dbFile = null
+  try {
+    // Real agy creates an empty <sessionId>.db during session/new before startTurn runs syncGenCursor.
+    enableSessions(kit, (rpc, agy) => {
+      if (rpc.method !== "session/new") return false
+      agy.sessionId = `fake-session-${++kit.sessionSerial}`
+      dbFile = conversationsPath(kit, agy.sessionId)
+      writer = openTestSqlite(dbFile)
+      agy.control({ kind: "list" })
+      agy.respond(rpc.id, { sessionId: agy.sessionId, models: { currentModelId: kit.initialAgyModel } })
+      return true
+    })
+    kit.prompts.push(async (agent) => {
+      writer.write(0, encodeGenMetadataBlob({ input: 48_000, read: 0, write: 1_200, output: 60, thinking: 15, response: 45, withNegativeSibling: true }))
+      await agent.tool("Read", { path: "/fixture/0" })
+      // Empty retry row (idx=1) is skipped; warm step (idx=2) carries 92% cache hit before any end_turn.
+      writer.write(1, encodeGenMetadataBlob({ model: 1007 }))
+      writer.write(2, encodeGenMetadataBlob({ input: 4_000, read: 48_000, write: 0, output: 75, thinking: 25, response: 50, withNegativeSibling: true }))
+      await agent.tool("Read", { path: "/fixture/1" })
+      writer.write(3, encodeGenMetadataBlob({ input: 3_000, read: 52_000, write: 300, output: 90, thinking: 30, response: 60 }))
+      await agent.tool("Read", { path: "/fixture/2" })
+      writer.write(4, encodeGenMetadataBlob({ input: 2_000, read: 55_000, write: 0, output: 80, thinking: 20, response: 60 }))
+      await agent.text("All steps complete.")
+      return { stopReason: "end_turn", usage: acpUsage(57_000, 155_000, 1_500, 305, 90) }
+    })
+
+    const body = await padBodyToTokens(kit, baseBody({ model: GEMINI }), 45_000)
+    const { steps, final } = await toolTurn(kit, body, 3)
+
+    assert.deepEqual(snapshot(steps[0].usage), vector([48_000, 60, 0, 1_200]))
+    assert.equal(steps[0].usage.output_tokens_details?.thinking_tokens, 15)
+    assert.deepEqual(snapshot(steps[1].usage), vector([4_000, 75, 48_000, 0]))
+    assert.equal(steps[1].usage.output_tokens_details?.thinking_tokens, 25)
+    assert.deepEqual(snapshot(steps[2].usage), vector([3_000, 90, 52_000, 300]))
+    assert.equal(steps[2].usage.output_tokens_details?.thinking_tokens, 30)
+    assert.deepEqual(snapshot(final.usage), vector([2_000, 80, 55_000, 0]))
+    assert.equal(final.usage.output_tokens_details?.thinking_tokens, 20)
+
+    const [turn] = kit.turns
+    assert.deepEqual(turn.responseSteps.map((step) => step.usageKind),
+      ["gen_metadata", "gen_metadata", "gen_metadata", "gen_metadata"])
+    assert.equal(turn.rawUsage.cachedReadTokens, 155_000)
+    const cal = turn.proc.calibration.get(turn.family)
+    assert.ok(Math.abs(cal.cacheRatio - 55_000 / 57_000) < 1e-6)
+
+    // Verify bridge closed all read-only SQLite statements/handles cleanly (Windows EBUSY guard).
+    writer.close()
+    writer = null
+    fs.rmSync(dbFile)
+    for (const suffix of ["-wal", "-shm"]) fs.rmSync(`${dbFile}${suffix}`, { force: true })
+    assert.equal(fs.existsSync(dbFile), false)
+  } finally {
+    writer?.close()
+  }
+}))
+
+test("cache stats: gen_metadata context floor lifts truncated upstream window while preserving exact cache share", () => withKit(async (kit) => {
+  let writer = null
+  try {
+    kit.prompts.push(async (agent) => {
+      writer = openTestSqlite(conversationsPath(kit, agent.sessionId))
+      writer.write(0, encodeGenMetadataBlob({ input: 4_000, read: 32_000, write: 4_000, output: 50, response: 50 }))
+      await agent.tool("Read", { path: "/fixture/floor" })
+      writer.write(1, encodeGenMetadataBlob({ input: 2_000, read: 36_000, write: 2_000, output: 40, response: 40 }))
+      await agent.text("Done.")
+      return { stopReason: "end_turn", usage: acpUsage(6_000, 68_000, 6_000, 90) }
+    })
+
+    const body = await padBodyToTokens(kit, baseBody({ model: GEMINI }), 100_000)
+    const firstEstimate = await kit.countTokens(body)
+    const { steps, final, estimate } = await toolTurn(kit, body, 1)
+
+    assert.equal(usageTotal(steps[0].usage), firstEstimate)
+    assert.equal(steps[0].usage.cache_read_input_tokens, Math.round(0.8 * firstEstimate))
+    assert.equal(steps[0].usage.cache_creation_input_tokens, Math.round(0.1 * firstEstimate))
+    assert.equal(usageTotal(final.usage), estimate)
+    assert.equal(final.usage.cache_read_input_tokens, Math.round(0.9 * estimate))
+    assert.deepEqual(kit.turns[0].responseSteps.map((step) => step.usageKind), ["context_floor", "context_floor"])
+  } finally {
+    writer?.close()
+  }
+}))
+
+test("cache stats: gen_metadata under context_floor still calibrates cacheRatio for unbatched sibling tool steps without dragging scale", () => withKit(async (kit) => {
+  let writer = null
+  try {
+    kit.prompts.push(async (agent) => {
+      writer = openTestSqlite(conversationsPath(kit, agent.sessionId))
+      // Step 0 has SQLite gen_metadata (4k uncached + 36k cache_read = 40k < 50k floor -> context_floor).
+      writer.write(0, encodeGenMetadataBlob({ input: 4_000, read: 36_000, write: 0, output: 50, response: 50 }))
+      await agent.tool("Read", { path: "/fixture/sibling-0" })
+      // Step 1 is an unbatched sibling tool call before agy flushes the next gen_metadata row.
+      await agent.tool("Read", { path: "/fixture/sibling-1" })
+      writer.write(1, encodeGenMetadataBlob({ input: 2_000, read: 38_000, write: 0, output: 40, response: 40 }))
+      await agent.text("Done.")
+      return { stopReason: "end_turn", usage: acpUsage(6_000, 74_000, 0, 90) }
+    })
+
+    const body = await padBodyToTokens(kit, baseBody({ model: GEMINI }), 100_000)
+    const { steps, final } = await toolTurn(kit, body, 2)
+    const cal = kit.turns[0].proc.calibration.get("gemini-4-argon")
+
+    // Step 1 (no new gen_metadata row) must use step 0's 90% cacheRatio instead of reporting cache_read = 0.
+    const step1Total = usageTotal(steps[1].usage)
+    assert.ok(step1Total >= 95_000, `sibling step total ${step1Total} collapsed`)
+    assert.equal(steps[1].usage.cache_read_input_tokens, Math.round(0.9 * step1Total))
+    assert.equal(cal?.scale, 1, "112 KiB clipped context_floor must not drag tokenizer scale down")
+    assert.equal(cal?.cacheRatio, 0.95)
+    assert.ok(final.usage.cache_read_input_tokens > 0)
+  } finally {
+    writer?.close()
+  }
+}))
+
+test("context window gate: returns Anthropic prompt-is-too-long 400 (without error.code) and reclaims active tool turn for reactive compaction", () => withKit(async (kit) => {
+  kit.env.AGY_BRIDGE_MAX_INPUT_TOKENS = "10000"
+
+  // 1. Oversized initial request is rejected before spawning agy, in exact Anthropic envelope.
+  const oversized = await padBodyToTokens(kit, baseBody({ model: "yce-magpie-agy/gemini-4-carbon[1m]" }), 12_000)
+  const res1 = await kit.request(oversized)
+  assert.equal(res1.status, 400)
+  assert.equal(res1.headers.get("x-should-retry"), "false")
+  const body1 = await res1.json()
+  assert.equal(body1.type, "error")
+  assert.deepEqual(Object.keys(body1.error).sort(), ["message", "type"])
+  assert.equal(body1.error.type, "invalid_request_error")
+  assert.match(body1.error.message, /^prompt is too long: \d+ tokens > 10000 maximum$/)
+  assert.equal(kit.acpLog.filter((entry) => entry.method === "session/new").length, 0)
+
+  // 2. Active tool turn whose tool_result crosses the limit reclaims the held turn cleanly,
+  //    then accepts both the reactive-compaction summary call and the compacted tool_result replay.
+  kit.prompts.push(async (agent) => {
+    try {
+      await agent.tool("Read", { path: "/fixture/huge" })
+    } catch {
+      return { stopReason: "cancelled" }
+    }
+    await agent.text("unreachable before reclaim")
+    return { stopReason: "end_turn", usage: WARM }
+  })
+  kit.prompts.push(async (agent) => {
+    await agent.text("<summary>Compacted context</summary>")
+    return { stopReason: "end_turn", usage: acpUsage(1_000, 0, 0, 50) }
+  })
+  kit.prompts.push(async (agent) => {
+    await agent.text("Recovered after reactive compaction.")
+    return { stopReason: "end_turn", usage: acpUsage(2_000, 1_500, 0, 30) }
+  })
+
+  const startBody = await padBodyToTokens(kit, baseBody({ model: "yce-magpie-agy/gemini-4-carbon[1m]" }), 4_000)
+  const step0 = await readSse(await kit.request(startBody))
+  assert.equal(step0.stopReason, "tool_use")
+  const toolUse = step0.content.find((block) => block.type === "tool_use")
+
+  const hugeResultBody = {
+    ...startBody,
+    messages: [
+      ...startBody.messages,
+      { role: "assistant", content: step0.content },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: toolUse.id, content: "x".repeat(36_000) }] },
+    ],
+  }
+  const resOverflow = await kit.request(hugeResultBody)
+  assert.equal(resOverflow.status, 400)
+  const errOverflow = await resOverflow.json()
+  assert.match(errOverflow.error.message, /^prompt is too long: \d+ tokens > 10000 maximum$/)
+
+  // Simulate Claude Code reactive_compact: summarize first, then replay compacted prefix + preserved tool round.
+  const summaryRes = await readSse(await kit.request(baseBody({
+    model: "yce-magpie-agy/gemini-4-carbon[1m]",
+    messages: [{ role: "user", content: "Summarize the conversation so far." }],
+  })))
+  assert.equal(summaryRes.error, null)
+
+  const compactedReplay = {
+    ...startBody,
+    messages: [
+      { role: "user", content: "This session is being continued from a previous conversation summary." },
+      { role: "assistant", content: step0.content },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: toolUse.id, content: "trimmed result" }] },
+    ],
+  }
+  const recovered = await readSse(await kit.request(compactedReplay))
+  assert.equal(recovered.error, null)
+  assert.equal(recovered.stopReason, "end_turn")
+  assert.match(recovered.content.find((block) => block.type === "text")?.text ?? "", /Recovered after reactive compaction/)
+}))
+
+test("cache stats: session/resume advances gen_metadata cursor past prior turns", async () => {
+  const { id, state, next } = await parkingFixture(GEMINI)
+  await withKit(async (kit) => {
+    installState(kit, state)
+    enableSessions(kit)
+    const customDir = path.join(kit.tmp, "custom-convs")
+    kit.env.AGY_BRIDGE_CONVERSATIONS_DIR = customDir
+    const writer = openTestSqlite(conversationsPath(kit, id))
+    try {
+      writer.write(0, encodeGenMetadataBlob({ input: 10_000, read: 11_111, output: 10, response: 10 }))
+      writer.write(1, encodeGenMetadataBlob({ input: 10_000, read: 22_222, output: 10, response: 10 }))
+      writer.write(2, encodeGenMetadataBlob({ input: 10_000, read: 33_333, output: 10, response: 10 }))
+
+      kit.prompts.push(async (agent) => {
+        assert.equal(agent.sessionId, id)
+        writer.write(3, encodeGenMetadataBlob({ input: 1_500, read: 64_000, output: 40, response: 40 }))
+        await agent.tool("Read", { path: "/fixture/resumed" })
+        writer.write(4, encodeGenMetadataBlob({ input: 1_000, read: 66_000, output: 30, response: 30 }))
+        await agent.text("Resumed OK.")
+        return { stopReason: "end_turn", usage: acpUsage(2_500, 130_000, 0, 70) }
+      })
+
+      const { steps, final } = await toolTurn(kit, next, 1)
+      assert.equal(logOf(kit, "resume")[0]?.params.sessionId, id)
+      assert.equal(logOf(kit, "new").length, 0)
+      assert.deepEqual(snapshot(steps[0].usage), vector([1_500, 40, 64_000, 0]))
+      assert.deepEqual(snapshot(final.usage), vector([1_000, 30, 66_000, 0]))
+    } finally {
+      writer.close()
+    }
+  })
+})
+
+test("cache stats: multi-step tool turn releases superseded request bodies, snapshots, sockets and non-deferred tool results", () => withKit(async (kit) => {
+  let midTurnObserved = null
+  kit.prompts.push(async (agent) => {
+    await agent.tool("Read", { path: "/fixture/mem-0" })
+    await agent.tool("Read", { path: "/fixture/mem-1" })
+    const [turn] = kit.turns
+    midTurnObserved = {
+      step0Body: turn.responseSteps[0].body,
+      step0Snapshot: turn.responseSteps[0].contentSnapshot,
+      call0Result: turn.calls[0].result,
+      call0Socket: turn.calls[0].socket,
+      call0Digest: turn.calls[0].resultDigest,
+    }
+    await agent.text("Done.")
+    return { stopReason: "end_turn", usage: WARM }
+  })
+
+  await toolTurn(kit, baseBody({ model: GEMINI }), 2)
+  assert.equal(midTurnObserved.step0Body, null)
+  assert.equal(midTurnObserved.step0Snapshot, null)
+  assert.equal(midTurnObserved.call0Result, null)
+  assert.equal(midTurnObserved.call0Socket, null)
+  assert.match(midTurnObserved.call0Digest, /^[0-9a-f]{64}$/)
+
+  const [turn] = kit.turns
+  assert.equal(turn.currentResponse, null)
+  for (const step of turn.responseSteps) {
+    assert.equal(step.body, null)
+    assert.equal(step.contentSnapshot, null)
+  }
+  for (const call of turn.calls) {
+    assert.equal(call.result, null)
+    assert.equal(call.socket, null)
+  }
 }))

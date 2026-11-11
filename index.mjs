@@ -3,6 +3,7 @@ import { spawn } from "node:child_process"
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto"
 import { once } from "node:events"
 import fs from "node:fs"
+import { createRequire } from "node:module"
 import net from "node:net"
 import os from "node:os"
 import path from "node:path"
@@ -231,6 +232,9 @@ function cloakPromptText(text) {
 }
 
 const FALLBACK_MODELS = [
+  { id: "gemini-4-carbon-high", name: "Gemini 4 Carbon (High)", effort: "high" },
+  { id: "gemini-4-carbon-medium", name: "Gemini 4 Carbon (Medium)", effort: "medium" },
+  { id: "gemini-4-carbon-low", name: "Gemini 4 Carbon (Low)", effort: "low" },
   { id: "gemini-4-argon-high", name: "Gemini 4 Argon (High)", effort: "high" },
   { id: "gemini-4-argon-medium", name: "Gemini 4 Argon (Medium)", effort: "medium" },
   { id: "gemini-4-argon-low", name: "Gemini 4 Argon (Low)", effort: "low" },
@@ -632,10 +636,28 @@ async function loadModelCatalog(agyPath) {
 
 function modelLimits(id) {
   const family = id.replace(/\[1m\]$/i, "").replace(/-(?:minimal|low|medium|high|xhigh|max)$/i, "")
-  if (/^(?:gemini-4-argon|gemini-3\.8-flash)$/i.test(family)) return { context: 1048576, output: 65536 }
+  if (/^(?:gemini-4-(?:carbon|argon)|gemini-3\.8-flash)$/i.test(family)) return { context: 1048576, output: 65536 }
   if (/^claude-(?:opus|sonnet)-5-5$/i.test(family)) return { context: 1000000, output: 64000 }
   if (/^gpt-oss-120b$/i.test(family)) return { context: 131072, output: 32768 }
   return undefined
+}
+
+function maxInputTokens(model, rawModel = "") {
+  if (Object.hasOwn(process.env, "AGY_BRIDGE_MAX_INPUT_TOKENS")) {
+    const raw = Number(process.env.AGY_BRIDGE_MAX_INPUT_TOKENS)
+    if (raw === 0) return 0
+    if (Number.isFinite(raw) && raw > 0) return Math.round(raw)
+  }
+  const limits = modelLimits(model) || modelLimits(rawModel)
+  if (limits) return Math.max(1, limits.context - limits.output)
+  if (/\[1m\]$/i.test(rawModel)) return 936_000
+  return 0
+}
+
+// Anthropic wire format without `error.code`, so Claude Code's reactive
+// compaction recognizer matches `prompt is too long: <actual> tokens > <limit> maximum`.
+function promptTooLongResponse(actualTokens, limitTokens) {
+  return jsonError(400, `prompt is too long: ${actualTokens} tokens > ${limitTokens} maximum`, undefined, { noRetry: true })
 }
 
 function normalizeEffort(value) {
@@ -991,6 +1013,10 @@ class Turn {
   }
 
   registerResponse(body) {
+    if (this.currentResponse) {
+      this.currentResponse.body = null
+      this.currentResponse.contentSnapshot = null
+    }
     const estimate = estimateInputTokens(body)
     const pending = this.pendingPromptStep
     const step = {
@@ -1062,22 +1088,26 @@ class Turn {
     this.emittedOutputTokens = tokenCount(this.emittedOutputTokens + usage.output_tokens)
     if (!final) this.toolResponseCount++
     // Calibration is per model family (see calibrationFamily) and learns only
-    // from the turn's own measured ACP numbers. A synthesized context floor, a
-    // missing usage object or a cancelled turn teaches nothing.
-    if (!final || !calibrate || step.usageKind === "context_floor") return
+    // from measured upstream numbers (ACP result.usage or per-step gen_metadata).
+    // An incremental ACP context_floor teaches nothing, whereas SQLite gen_metadata
+    // under a clipped 112 KiB prompt still measures the real upstream cacheRatio
+    // (while leaving tokenizer `scale` untouched).
+    const hasGenRaw = Boolean(step.genRaw)
+    if (!calibrate || (!final && !hasGenRaw) || (step.usageKind === "context_floor" && !hasGenRaw)) return
     const family = this.family || calibrationFamily(this.model)
     const previous = this.proc.calibration.get(family) || { scale: 1, cacheRatio: 0, at: 0 }
     const next = { ...previous }
     let changed = false
     const total = usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens
     const estimate = this.stepInputEstimates[step.estimateIndex] || step.inputEstimate
-    // Only an exact lone model call measures the tokenizer; an incremental ACP
-    // result.usage (a fraction of the window) would drag the scale to its clamp.
-    if (step.usageKind === "exact" && total > 0 && estimate > 0 && total >= 0.5 * estimate) {
+    // Only a single-generation measurement (exact or gen_metadata) measures the
+    // tokenizer; an accumulated ACP result.usage would drag the scale to its clamp.
+    if ((step.usageKind === "exact" || step.usageKind === "gen_metadata") &&
+      total > 0 && estimate > 0 && total >= 0.5 * estimate) {
       next.scale = Math.max(0.5, Math.min(1.5, total / estimate))
       changed = true
     }
-    const raw = this.rawUsage
+    const raw = step.genRaw || this.rawUsage
     const input = tokenCount(raw?.inputTokens)
     const read = tokenCount(raw?.cachedReadTokens)
     const write = tokenCount(raw?.cachedWriteTokens)
@@ -1320,6 +1350,7 @@ class Proc {
     this.inheritedCalibration = opts.inheritCalibration || null
     this.token = randomUUID()
     this.sessionId = null
+    this.lastGenIdx = -1
     this.currentModel = null
     this.agentVersion = null
     this.supportsImages = false
@@ -1479,6 +1510,7 @@ class Proc {
         this.expectedMessages = this.resumeFrom.expectedMessages.map((message) => ({ ...message }))
         consumeParked(this.resumeFrom.key, this.resumeFrom.sessionId)
         restoreCalibration(this, this.resumeFrom.calibration, true)
+        syncGenCursor(this)
       } catch (error) {
         session = null
         const reason = resumeFailureReason(error, this)
@@ -1497,6 +1529,8 @@ class Proc {
       this.sessionId = session.sessionId
       restoreCalibration(this, this.inheritedCalibration || this.resumeFrom?.calibration, false)
     }
+    this.resumeFrom = null
+    this.inheritedCalibration = null
     // A resumed session reports the account default; always apply the selection.
     this.currentModel = session?.models?.currentModelId ?? null
     this.configOptions = Array.isArray(session?.configOptions) ? session.configOptions : []
@@ -1646,6 +1680,7 @@ class Proc {
     if (content.some(block => block.type === "image") && !this.supportsImages) {
       throw new UnsupportedContent("image input with this agy ACP server; update to an image-capable agy version")
     }
+    syncGenCursor(this)
     const turn = new Turn(this, messages)
     // Settlement and calibration of this turn belong to the model it runs on.
     turn.model = model || this.currentModel || this.model || ""
@@ -1863,6 +1898,7 @@ class Proc {
       ready: true,
       socket,
       result: null,
+      resultDigest: null,
       deferred: false,
       lateDelivered: false,
       deadline: null,
@@ -1953,14 +1989,16 @@ class Proc {
     for (const item of results) {
       const id = item.block.tool_use_id
       const serialized = JSON.stringify(item.result)
+      const resultDigest = digest(serialized)
       const previous = unique.get(id)
-      if ((previous && JSON.stringify(previous.result) !== serialized) ||
-        (item.call.result && JSON.stringify(item.call.result) !== serialized)) {
+      const existingDigest = item.call.resultDigest ?? (item.call.result ? digest(JSON.stringify(item.call.result)) : null)
+      if ((previous && previous.resultDigest !== resultDigest) ||
+        (existingDigest && existingDigest !== resultDigest)) {
         const error = new Error(`agy bridge: conflicting duplicate result for ${id}`)
         error.statusCode = 409
         throw error
       }
-      if (!previous) unique.set(id, item)
+      if (!previous) unique.set(id, { ...item, resultDigest })
     }
     return unique
   }
@@ -1969,17 +2007,18 @@ class Proc {
     const turn = this.turn
     if (!turn || turn.finalized) throw new BusyError("agy bridge: no response is waiting for these tool results")
     turn.touchClient()
-    for (const { call, result } of this.validateResults(results).values()) {
+    for (const { call, result, resultDigest } of this.validateResults(results).values()) {
       clearTimeout(call.deadline)
       if (call.deferred) {
         if (!call.result) {
           call.result = result
+          call.resultDigest = resultDigest
           this.#deliverLate(turn, call)
         }
         continue
       }
       if (call.mcpResponded || !call.ready || turn.done) continue
-      call.result = result
+      call.resultDigest = resultDigest
       this.#respondMcp(call, { result })
     }
     turn.arm()
@@ -1989,8 +2028,10 @@ class Proc {
   #respondMcp(call, payload) {
     if (call.mcpResponded) return
     call.mcpResponded = true
-    if (call.socket?.writable) call.socket.end(JSON.stringify(payload) + "\n")
-    else call.socket?.destroy()
+    const socket = call.socket
+    call.socket = null
+    if (socket?.writable) socket.end(JSON.stringify(payload) + "\n")
+    else socket?.destroy()
   }
 
   finalizeTurn(turn) {
@@ -2015,7 +2056,14 @@ class Proc {
           ? { result: { content: [{ type: "text", text: turn.closeNote }], isError: true } }
           : { error: { code: -32603, message: "agy bridge: response closed before the tool result arrived" } })
       }
+      call.result = null
+      call.socket = null
     }
+    for (const step of turn.responseSteps) {
+      step.body = null
+      step.contentSnapshot = null
+    }
+    turn.currentResponse = null
     if (this.turn === turn) {
       this.turn = null
       if (!this.stopping && !this.retiring) park(this)
@@ -4337,6 +4385,213 @@ function tokenCount(value) {
   return Number.isFinite(number) ? Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Math.round(number))) : 0
 }
 
+const moduleRequire = createRequire(import.meta.url)
+let sqliteDriver = null
+
+function getSqliteDriver() {
+  if (sqliteDriver !== null) return sqliteDriver
+  try {
+    if (typeof globalThis.Bun !== "undefined") {
+      const { Database } = moduleRequire("bun:sqlite")
+      sqliteDriver = { kind: "bun", Database }
+    } else {
+      const { DatabaseSync } = process.getBuiltinModule?.("node:sqlite") ?? moduleRequire("node:sqlite")
+      sqliteDriver = { kind: "node", DatabaseSync }
+    }
+  } catch {
+    sqliteDriver = false
+  }
+  return sqliteDriver
+}
+
+function sessionDbFile(proc) {
+  const id = proc?.sessionId
+  if (typeof id !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(id)) return null
+  const dir = process.env.AGY_BRIDGE_CONVERSATIONS_DIR ||
+    path.join(os.homedir(), ".gemini", "antigravity-cli", "conversations")
+  const file = path.join(dir, `${id}.db`)
+  try {
+    return fs.statSync(file).isFile() ? file : null
+  } catch {
+    return null
+  }
+}
+
+function querySessionDb(file, sql, ...params) {
+  const driver = getSqliteDriver()
+  if (!driver) return null
+  if (driver.kind === "bun") {
+    let db = null
+    let stmt = null
+    try {
+      db = new driver.Database(file, { readonly: true })
+      stmt = db.prepare(sql)
+      return stmt.all(...params)
+    } catch {
+      return null
+    } finally {
+      try { stmt?.finalize?.() } catch {}
+      try { db?.close?.(false) } catch {}
+    }
+  }
+  let db = null
+  try {
+    db = new driver.DatabaseSync(file, { readOnly: true, timeout: 50 })
+    return db.prepare(sql).all(...params)
+  } catch {
+    return null
+  } finally {
+    try { db?.close?.() } catch {}
+  }
+}
+
+function readProtoVarint(bytes, offset, end) {
+  let value = 0n
+  let shift = 0n
+  let pos = offset
+  while (pos < end && shift < 70n) {
+    const byte = bytes[pos++]
+    value |= BigInt(byte & 0x7f) << shift
+    if ((byte & 0x80) === 0) return { value, next: pos }
+    shift += 7n
+  }
+  return null
+}
+
+function protoTokenCount(big) {
+  if (big <= 0n || big >= (1n << 62n)) return 0
+  return big > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(big)
+}
+
+// Decodes exa.codeium_common_pb.ModelUsageStats (field 1.4 in agy's SQLite
+// gen_metadata blob): f2=input_tokens, f3=output_tokens, f4=cache_write_tokens,
+// f5=cache_read_tokens, f9=thinking_output_tokens, f10=response_output_tokens.
+function parseModelUsageStats(bytes, start, end) {
+  let inputTokens = 0
+  let reportedOutput = 0
+  let cachedWriteTokens = 0
+  let cachedReadTokens = 0
+  let thoughtTokens = 0
+  let responseTokens = 0
+  let pos = start
+  while (pos < end) {
+    const tag = readProtoVarint(bytes, pos, end)
+    if (!tag) return null
+    pos = tag.next
+    const field = Number(tag.value >> 3n)
+    const wire = Number(tag.value & 7n)
+    if (wire === 0) {
+      const val = readProtoVarint(bytes, pos, end)
+      if (!val) return null
+      pos = val.next
+      if (field === 2) inputTokens = protoTokenCount(val.value)
+      else if (field === 3) reportedOutput = protoTokenCount(val.value)
+      else if (field === 4) cachedWriteTokens = protoTokenCount(val.value)
+      else if (field === 5) cachedReadTokens = protoTokenCount(val.value)
+      else if (field === 9) thoughtTokens = protoTokenCount(val.value)
+      else if (field === 10) responseTokens = protoTokenCount(val.value)
+    } else if (wire === 1) {
+      pos += 8
+      if (pos > end) return null
+    } else if (wire === 2) {
+      const len = readProtoVarint(bytes, pos, end)
+      if (!len) return null
+      pos = len.next + protoTokenCount(len.value)
+      if (pos > end) return null
+    } else if (wire === 5) {
+      pos += 4
+      if (pos > end) return null
+    } else {
+      return null
+    }
+  }
+  const outputTokens = Math.max(reportedOutput, thoughtTokens + responseTokens)
+  if (inputTokens + cachedReadTokens + cachedWriteTokens + outputTokens <= 0) return null
+  return {
+    inputTokens,
+    cachedReadTokens,
+    cachedWriteTokens,
+    outputTokens,
+    thoughtTokens,
+    totalTokens: inputTokens + cachedReadTokens + cachedWriteTokens + outputTokens,
+  }
+}
+
+function parseGenMetadataUsage(blob) {
+  if (!(blob instanceof Uint8Array) || !blob.length) return null
+  let found = null
+  const scanMessage = (start, end, targetField, onSubmessage) => {
+    let pos = start
+    while (pos < end) {
+      const tag = readProtoVarint(blob, pos, end)
+      if (!tag) return
+      pos = tag.next
+      const field = Number(tag.value >> 3n)
+      const wire = Number(tag.value & 7n)
+      if (wire === 0) {
+        const val = readProtoVarint(blob, pos, end)
+        if (!val) return
+        pos = val.next
+      } else if (wire === 1) {
+        pos += 8
+      } else if (wire === 2) {
+        const len = readProtoVarint(blob, pos, end)
+        if (!len) return
+        const subStart = len.next
+        const subEnd = subStart + protoTokenCount(len.value)
+        if (subEnd > end) return
+        if (field === targetField) onSubmessage(subStart, subEnd)
+        pos = subEnd
+      } else if (wire === 5) {
+        pos += 4
+      } else {
+        return
+      }
+    }
+  }
+  scanMessage(0, blob.length, 1, (outerStart, outerEnd) => {
+    scanMessage(outerStart, outerEnd, 4, (statsStart, statsEnd) => {
+      const stats = parseModelUsageStats(blob, statsStart, statsEnd)
+      if (stats) found = stats
+    })
+  })
+  return found
+}
+
+function syncGenCursor(proc) {
+  const file = sessionDbFile(proc)
+  if (!file) return
+  const rows = querySessionDb(file, "SELECT MAX(idx) AS maxIdx FROM gen_metadata")
+  const rawMax = rows?.[0]?.maxIdx
+  if (rawMax === null || rawMax === undefined) return
+  const maxIdx = Number(rawMax)
+  if (Number.isInteger(maxIdx) && maxIdx > proc.lastGenIdx) proc.lastGenIdx = maxIdx
+}
+
+// agy writes per-generation ModelUsageStats into conversations/<sessionId>.db
+// before invoking each MCP tool call, while ACP omits intermediate usage until
+// session/prompt returns. Advance the per-session cursor and return the latest
+// valid generation added since the previous response step.
+function consumeStepGenUsage(proc, turn) {
+  const file = sessionDbFile(proc)
+  if (!file) return null
+  const rows = querySessionDb(file, "SELECT idx, data FROM gen_metadata WHERE idx > ? ORDER BY idx ASC", proc.lastGenIdx)
+  if (!Array.isArray(rows) || !rows.length) return null
+  let lastRaw = null
+  for (const row of rows) {
+    const rawIdx = row?.idx
+    if (rawIdx !== null && rawIdx !== undefined) {
+      const idx = Number(rawIdx)
+      if (Number.isInteger(idx) && idx > proc.lastGenIdx) proc.lastGenIdx = idx
+    }
+    const parsed = parseGenMetadataUsage(row?.data)
+    if (parsed) lastRaw = parsed
+  }
+  if (!lastRaw) return null
+  const translated = translateUsage(lastRaw, proc, turn)
+  return translated ? { raw: lastRaw, translated } : null
+}
+
 // ACP usage accumulates the internal model calls of one session/prompt, in
 // agy's exclusive ledger (same for every model family): inputTokens (I) is
 // uncached input only and excludes cachedReadTokens (R) and cachedWriteTokens
@@ -4454,8 +4709,9 @@ function estimatedInputUsage(proc, estimate, family) {
 function responseUsage(proc, turn, step, content, result) {
   if (step.settled) return step.usage
   const final = result !== undefined
+  const cancelled = result?.stopReason === "cancelled"
   const translated = final ? translateUsage(result?.usage, proc, turn) : null
-  const single = final && result?.stopReason !== "cancelled" && !turn.calls.length &&
+  const single = final && !cancelled && !turn.calls.length &&
     !turn.toolResponseCount && !turn.hasLatePrompt && turn.promptCount <= 1 && turn.responseSteps.length === 1
   step.usageKind = single && translated ? "exact" : "bounded_step_estimate"
 
@@ -4471,17 +4727,35 @@ function responseUsage(proc, turn, step, content, result) {
     ? [translated.input_tokens, translated.cache_read_input_tokens, translated.cache_creation_input_tokens]
     : [0, 0, 0]
   const measuredTotal = measured[0] + measured[1] + measured[2]
-  const lifted = () => {
+  const lifted = (buckets = measured, total = measuredTotal) => {
     step.usageKind = "context_floor"
-    return measuredTotal > 0 ? splitInputUsage(window, ...measured) : estimatedInputUsage(proc, estimate, family)
+    return total > 0 ? splitInputUsage(window, ...buckets) : estimatedInputUsage(proc, estimate, family)
   }
   if (single && translated) {
     if (!(floor > 0 && measuredTotal < floor)) return translated
     return { ...translated, ...lifted() }
   }
 
+  const gen = !single && !cancelled ? consumeStepGenUsage(proc, turn) : null
+  const genMeasured = gen
+    ? [gen.translated.input_tokens, gen.translated.cache_read_input_tokens, gen.translated.cache_creation_input_tokens]
+    : [0, 0, 0]
+  const genTotal = genMeasured[0] + genMeasured[1] + genMeasured[2]
+
   let inputUsage
-  if (!final || measuredTotal === 0) {
+  if (genTotal > 0) {
+    step.genRaw = gen.raw
+    if (floor > 0 && genTotal < floor) {
+      inputUsage = lifted(genMeasured, genTotal)
+    } else {
+      step.usageKind = "gen_metadata"
+      inputUsage = {
+        input_tokens: genMeasured[0],
+        cache_read_input_tokens: genMeasured[1],
+        cache_creation_input_tokens: genMeasured[2],
+      }
+    }
+  } else if (!final || measuredTotal === 0) {
     // No measured numbers for this step: the scaled estimate split by the
     // family's cache ratio; nothing is known about cache writes.
     inputUsage = estimatedInputUsage(proc, estimate, family)
@@ -4492,10 +4766,14 @@ function responseUsage(proc, turn, step, content, result) {
     inputUsage = floor > 0 && stepTotal < floor ? lifted() : splitInputUsage(stepTotal, ...measured)
   }
   const emitted = responseOutputEstimate(content)
-  const output = final
-    ? Math.max(emitted.output, tokenCount((translated?.output_tokens || 0) - turn.emittedOutputTokens))
-    : Math.max(1, emitted.output)
-  const thinking = Math.min(output, emitted.thinking)
+  const genOutput = gen ? gen.translated.output_tokens : 0
+  const genThinking = gen ? tokenCount(gen.translated.output_tokens_details?.thinking_tokens) : 0
+  const output = gen
+    ? Math.max(final ? 0 : 1, emitted.output, genOutput)
+    : final
+      ? Math.max(emitted.output, tokenCount((translated?.output_tokens || 0) - turn.emittedOutputTokens))
+      : Math.max(1, emitted.output)
+  const thinking = Math.min(output, Math.max(emitted.thinking, genThinking))
   return {
     ...inputUsage,
     output_tokens: output,
@@ -4594,7 +4872,7 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
         if (signal && abortHandler) signal.removeEventListener("abort", abortHandler)
         abortHandler = null
       }
-      const stopMessage = (stopReason, usage, final = false, calibrate = final) => {
+      const stopMessage = (stopReason, usage, final = false, calibrate = final || Boolean(step.genRaw)) => {
         // The final, absolute usage of this response: always all four fields
         // (a missing one is 0), never an increment over message_start.
         send("message_delta", {
@@ -5208,6 +5486,8 @@ export const AntigravityBridgePlugin = async (input, packageOptions) => {
                 messages: body.messages, layout, nonstream: body.stream === false, reqId, convKey,
                 hasToolResults: resultBlocks.length > 0 }
               const begin = (proc, history) => beginTurn(proc, history, body, callerWorkDir, model, selection)
+              const limitTokens = maxInputTokens(model, rawModel)
+              const inputEstimate = limitTokens > 0 ? estimateInputTokens(body) : 0
               if (resultBlocks.length) {
                 const matches = matchToolResults(body, resultBlocks)
                 const found = matches.filter((item) => item.match)
@@ -5245,6 +5525,10 @@ export const AntigravityBridgePlugin = async (input, packageOptions) => {
                     }
                   }
                   if (!interrupted) proc.validateResults(results)
+                  if (limitTokens > 0 && inputEstimate > limitTokens) {
+                    await reclaimStaleTurn(proc, turn, "agy bridge: prompt exceeded context window")
+                    return promptTooLongResponse(inputEstimate, limitTokens)
+                  }
                   const directIdsMatch = matches.every((item) => item.match?.call?.id === item.block.tool_use_id)
                   const historyMatches = directIdsMatch
                     ? proc.matchesPendingTurnHistory(turn, trailingMessages(body).history)
@@ -5289,6 +5573,10 @@ export const AntigravityBridgePlugin = async (input, packageOptions) => {
                   // The held turn can never progress again, or the same unmatched
                   // results hit it too often without progress: reclaim it and
                   // replay this request's own tool round once, under one lock.
+                  if (limitTokens > 0 && inputEstimate > limitTokens && !replayHistoryProblem(body, resultBlocks)) {
+                    await reclaimStaleTurn(held, held.turn, "agy bridge: prompt exceeded context window")
+                    return promptTooLongResponse(inputEstimate, limitTokens)
+                  }
                   const recovery = await recoverStaleTurn({ agy, convKey, proc: held, turn: held.turn,
                     body, resultBlocks, acquireOpts, isFresh, begin, attempts })
                   if (recovery.kind === "replayed") {
@@ -5318,6 +5606,9 @@ export const AntigravityBridgePlugin = async (input, packageOptions) => {
                 if (replayHistoryProblem(body, resultBlocks)) {
                   throw new ConflictError("agy bridge: incomplete tool history. Stop resending it; continue from the last self-consistent message.", "tool_history_incomplete")
                 }
+              }
+              if (limitTokens > 0 && inputEstimate > limitTokens) {
+                return promptTooLongResponse(inputEstimate, limitTokens)
               }
 
               const { proc, history } = await acquireProc(

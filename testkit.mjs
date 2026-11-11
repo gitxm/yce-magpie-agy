@@ -86,6 +86,9 @@ export function modelsOutput(rows) {
 
 // 与 index.mjs 里 FALLBACK_MODELS 同形状的 agy models 输出，外加只在动态目录里出现的型号。
 export const BASE_MODEL_ROWS = [
+  ["gemini-4-carbon-high", "Gemini 4 Carbon (High)"],
+  ["gemini-4-carbon-medium", "Gemini 4 Carbon (Medium)"],
+  ["gemini-4-carbon-low", "Gemini 4 Carbon (Low)"],
   ["gemini-4-argon-high", "Gemini 4 Argon (High)"],
   ["gemini-4-argon-medium", "Gemini 4 Argon (Medium)"],
   ["gemini-4-argon-low", "Gemini 4 Argon (Low)"],
