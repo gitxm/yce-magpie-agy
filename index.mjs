@@ -5831,7 +5831,7 @@ async function migrateLegacyBridgeSessions({
 }
 
 function scheduleLegacyBridgeMigration() {
-  if (legacyMigrationInFlight || process.env.AGY_BRIDGE_CONVERSATIONS_DIR) return
+  if (legacyMigrationInFlight || process.env.AGY_BRIDGE_CONVERSATIONS_DIR || process.env.AGY_BRIDGE_STATE_FILE) return
   const appDataDir = bridgeAppDataDirName()
   if (!appDataDir) return
   const home = os.homedir()
