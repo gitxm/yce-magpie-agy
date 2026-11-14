@@ -9,7 +9,7 @@ import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { createUsageReader, exhaustedWindows, maskedAccountReport } from "./usage.mjs"
-import { backgroundBlocked, cannotSignIn, forgetStoredSignIn, storedSignInNow } from "./signin.mjs"
+import { backgroundBlocked, cannotSignIn, forgetStoredSignIn, isDead, storedSignIn, storedSignInNow } from "./signin.mjs"
 import { sanitizePatternFields } from "./re2-pattern.mjs"
 import { startLogin } from "./login.mjs"
 import { ensureGeminiArrayItems } from "./array-items.mjs"
@@ -469,27 +469,35 @@ function parseAgyModels(stdout) {
 // take seconds on a real agy, and the host lists models right after.
 const OFFERED_SIGNIN_WAIT_MS = 3_000
 
+const PROBE_AUTH_TALK = /accounts\.google\.com|not (?:logged|signed) in|unauthenticated|authentication (?:required|expired)|login required|please (?:log|sign) in|sign in again|invalid_grant/i
+const PROBE_NETWORK_TALK = /\b(?:eof|timeout|timed out|deadline exceeded|no such host|connection (?:refused|reset)|network|proxy|tls|ssl|certificate|dial tcp)\b/i
+
 async function probeSignedIn(agy) {
-  // no sign-in stored, or one agy failed with: `agy models` would start
-  // agy's own Google sign-in (on Windows, a browser no shim stops), so the
-  // caller goes on to magpie's own sign-in link instead
-  const blocked = await backgroundBlocked({ fresh: true })
-  if (blocked) return { ok: false, why: blocked }
+  // User-initiated sign-in probe: skip `agy models` only when no usable local
+  // credential exists (`cannotSignIn`), never on a stale background `isDead`
+  // mark that a working `agy models` run can clear.
+  const stored = await storedSignIn({ fresh: true })
+  const missing = cannotSignIn(stored)
+  if (missing) return { ok: false, why: missing, stored, authFailed: true, networkFailed: false }
   const probe = await execOnce(agy, ["models"], { timeoutMs: 15_000 })
   const listed = !probe.err && !probe.timedOut && probe.code === 0 &&
     probe.stdout.split("\n").some(line => /^\S+\s+\S/.test(line.trim()))
   if (listed) {
+    forgetStoredSignIn({ dead: true })
     const list = parseAgyModels(probe.stdout)
     if (list) {
       useAgyPath(agy)
       storeListedCatalog(agy, list, Date.now())
     }
-    return { ok: true }
+    return { ok: true, stored }
   }
+  const output = `${probe.stderr || ""}\n${probe.stdout || ""}\n${probe.err?.message || ""}`
+  const authFailed = PROBE_AUTH_TALK.test(output)
+  const networkFailed = !authFailed && (probe.timedOut || PROBE_NETWORK_TALK.test(output))
   const why = probe.timedOut
     ? "`agy models` timed out after 15s"
     : `\`agy models\` says: ${(probe.stderr || probe.stdout || "").trim().split(/\r?\n/).filter(Boolean).at(-1) || probe.err?.message || `exit ${probe.code}`}`
-  return { ok: false, why }
+  return { ok: false, why, stored, authFailed, networkFailed }
 }
 
 const EFFORT_ORDER = ["minimal", "low", "medium", "high", "xhigh", "max"]
@@ -2278,6 +2286,7 @@ class Proc {
         // deliver its real result in a follow-up prompt of the same response.
         const late = turn.calls.filter((call) => call.deferred && !call.lateDelivered)
         if (!late.length) {
+          if (isDead(storedSignInNow())) forgetStoredSignIn({ dead: true })
           turn.complete({ ...(result ?? {}), usage })
           return
         }
@@ -3243,6 +3252,7 @@ async function switchAccount(target, { reason, sourceAccount }) {
       switchEvent(reason, result.restored === false ? "切号失败且原账号还原失败" : "切号失败，原账号已保留")
       return
     }
+    forgetStoredSignIn({ dead: true })
     activeAccount = accountKey(target)
     accountGeneration++
     acpOfferedModels = null
@@ -6573,8 +6583,15 @@ export const AntigravityBridgePlugin = async (input, packageOptions) => {
             } finally {
               if (admitted) preparingRequests--
             }
-            // signed in to agy already: nothing to open
-            if (probe.ok) {
+            // signed in to agy already (or local renewable credential hit only a
+            // transient network/timeout error during `agy models`): reuse local agy
+            const canReuseLocal = probe.ok || (
+              probe.stored?.state === "present" &&
+              probe.stored.canRenew &&
+              probe.networkFailed &&
+              !isDead(probe.stored)
+            )
+            if (canReuseLocal) {
               if (autoSwitchEnabled()) captureCurrent({ home: os.homedir(), vaultDir: defaultVaultDir() })
               return { url: "", instructions: "", method: "auto", callback: async () => ({ type: "success", key: "agy" }) }
             }

@@ -415,8 +415,15 @@ export function createUsageReader(resolveAgy, options = {}) {
         if (error?.kind === "cancel" || !trackSignIn) {
           return { windows: [], error: message, signIn: "kept" }
         }
-        const auth = error?.kind === "auth" || error?.kind === "timeout" && stored?.state === "present" && stored.expired &&
-          (!String(error.output ?? "").trim() || SIGN_IN_TALK.test(error.output))
+        // Google OAuth access tokens expire every hour while refresh_token stays
+        // valid (`canRenew: true`). An empty-output `/usage` timeout is only an
+        // auth failure when the stored token cannot renew itself or agy printed
+        // a sign-in prompt before timing out.
+        const unrenewableExpired = stored?.state === "present" && stored.expired && !stored.canRenew
+        const auth = error?.kind === "auth" || error?.kind === "timeout" && (
+          SIGN_IN_TALK.test(error.output) ||
+          unrenewableExpired && !String(error.output ?? "").trim()
+        )
         if (auth && stored?.state === "present") {
           noteDead(stored)
           return expired("agy's sign-in no longer works")

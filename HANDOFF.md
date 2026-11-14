@@ -1,3 +1,21 @@
+## 2026-11-14：修复 macOS 本地凭证识别与登录态误判过期（v0.3.1）
+
+- **根因**：`v0.3.0` 合入上游 `signin.mjs` + `usage.mjs` 后存在三处联动问题：①macOS 下 `readStoredSignIn`
+  执行 `/usr/bin/security find-generic-password -s gemini -a antigravity -w`，带 `-w` 解密 Go `go-keyring`
+  写入的钥匙串密文会触发 macOS Keychain ACL 弹窗或 `errSecInteractionNotAllowed` 失败，且未兜底读取
+  `~/.gemini/antigravity-cli/antigravity-oauth-token`；②Google OAuth 的 `token.expiry` 是 1 小时
+  `access_token` 时间戳（`refresh_token` 仍有效，`canRenew: true`），旧 `usage.mjs` 在 `stored.expired`
+  且 `/usage` 15 秒空输出超时（休眠唤醒、代理抖动）时直接判为 `auth` 失效，调 `noteDead` 并向 Magpie 返回
+  `signIn: "expired"`，导致客户端被踢回重登录；③`probeSignedIn` 复用了 `backgroundBlocked`（含 `isDead`），
+  且 `authorize()` 未区分 `agy models` 瞬时网络超时与真正未登录。
+- **修复**：`signin.mjs` 在 `darwin` 去掉 `-w` 仅查钥匙串公开属性（按 `mdat` 等属性哈希轮换 `fp`），在
+  `win32` 改用 `spawn` + `-EncodedCommand`（去掉触发终端安全拦截超时的 `-ExecutionPolicy Bypass` 并排空
+  stderr CLIXML 进度流），并在 `darwin`/`win32`/`linux` 补齐 `antigravity-oauth-token` 兜底与切号指纹
+  融合；`usage.mjs` 仅在无 `refresh_token`（`!stored.canRenew`）的过期空超时或输出含登录提示时才判
+  `signIn: "expired"`；`index.mjs` 的 `probeSignedIn` 忽略陈旧 `isDead`、成功列模型/完成对话/切号时清理
+  `dead`，且本地存在可续期凭证而 `agy models` 仅遇网络超时时自动复用本地登录态。新增 `test-signin.mjs`
+  5 项回归单测（Linux Node 与 Windows 原生 Bun 双端通过）。
+
 ## 2026-11-13：同步社区上游 agy-cli 0.1.4–0.1.39（v0.3.0）与自动跟进
 
 - **起因**：本机 Magpie 日志（`AppData/Local/magpie/logs/app.log`）与

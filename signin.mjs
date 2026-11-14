@@ -1,12 +1,16 @@
-import { execFile } from "node:child_process"
+import { spawn } from "node:child_process"
 import { createHash } from "node:crypto"
+import fs from "node:fs"
+import os from "node:os"
+import { tokenFileOf } from "./accounts.mjs"
 
 // What agy's own sign-in looks like on this computer, read without running
 // agy. agy keeps its Google token in the system keyring through go-keyring,
-// under service "gemini" and user "antigravity": on macOS a generic
-// password `security` wrote (so `security` reads it back without a prompt),
-// on Windows the generic credential "gemini:antigravity" in Credential
-// Manager. The value is JSON (on macOS behind "go-keyring-base64:"):
+// under service "gemini" and user "antigravity" (and/or in
+// ~/.gemini/antigravity-cli/antigravity-oauth-token): on macOS `security`
+// checks the generic password's public item attributes without `-w` so
+// Keychain never prompts to decrypt; on Windows PowerShell reads
+// "gemini:antigravity" from Credential Manager. Token file JSON shape:
 //   {"token":{"access_token","refresh_token","expiry","expires_in","token_type"},
 //    "auth_method":"consumer","id_token_email":…}
 //
@@ -67,14 +71,44 @@ try {
 } finally { [MagpieAgy.Cred]::CredFree($p) }
 `
 
+const WINDOWS_ENCODED_SCRIPT = Buffer.from(WINDOWS_SCRIPT, "utf16le").toString("base64")
+
 function run(file, args) {
   return new Promise((resolve) => {
+    let child
     try {
-      execFile(file, args, { timeout: READ_TIMEOUT_MS, windowsHide: true, maxBuffer: 1024 * 1024, encoding: "utf8" },
-        (error, stdout) => resolve({ code: error ? (typeof error.code === "number" ? error.code : -1) : 0, stdout: String(stdout ?? "") }))
+      child = spawn(file, args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true })
     } catch {
       resolve({ code: -1, stdout: "" })
+      return
     }
+    const chunks = []
+    let bytes = 0
+    let settled = false
+    const finish = (code) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      const stdout = chunks.length
+        ? (Buffer.isBuffer(chunks[0]) ? Buffer.concat(chunks).toString("utf8") : chunks.join(""))
+        : ""
+      resolve({ code, stdout })
+    }
+    const timer = setTimeout(() => {
+      try { child.kill("SIGKILL") } catch {}
+      finish(-1)
+    }, READ_TIMEOUT_MS)
+    child.stdout?.on("data", (chunk) => {
+      if (bytes < 1024 * 1024) {
+        chunks.push(chunk)
+        bytes += chunk.length
+      }
+    })
+    // Drain stderr via a data listener (Bun on Windows only starts reading the
+    // pipe on `"data"`, and PowerShell `-EncodedCommand` emits CLIXML on stderr).
+    child.stderr?.on("data", () => {})
+    child.on("error", () => finish(-1))
+    child.on("close", (code) => finish(typeof code === "number" ? code : -1))
   })
 }
 
@@ -103,29 +137,93 @@ export function parseStored(raw, now = Date.now()) {
   return { state: "present", fp, canRenew, expiresAt, expired: expiresAt > 0 && now >= expiresAt }
 }
 
+// Keychain attribute output from `/usr/bin/security find-generic-password` (without `-w`).
+const DARWIN_KEYCHAIN_ATTR_RE = /(?:keychain:|class:\s*"genp"|attributes:|"acct"|"svce")/
+
+function resolveHome(env, explicitHome) {
+  if (typeof explicitHome === "string" && explicitHome.trim()) return explicitHome.trim()
+  if (typeof env?.HOME === "string" && env.HOME.trim()) return env.HOME.trim()
+  if (typeof env?.USERPROFILE === "string" && env.USERPROFILE.trim()) return env.USERPROFILE.trim()
+  return os.homedir()
+}
+
+function readTokenFile(home, now) {
+  if (!home) return null
+  let raw
+  try {
+    raw = fs.readFileSync(tokenFileOf(home), "utf8")
+  } catch (error) {
+    if (error?.code === "ENOENT") return null
+    return { state: "unknown" }
+  }
+  return parseStored(raw, now)
+}
+
+function combineFp(primaryFp, file) {
+  if (file?.state === "present" && file.fp && file.fp !== primaryFp) {
+    return createHash("sha256").update(`${primaryFp}:${file.fp}`).digest("hex").slice(0, 32)
+  }
+  return primaryFp
+}
+
 // readStoredSignIn reads agy's stored sign-in on this computer.
-export async function readStoredSignIn({ platform = process.platform, exec = run, now = Date.now(), env = process.env } = {}) {
+export async function readStoredSignIn({ platform = process.platform, exec = run, now = Date.now(), env = process.env, home } = {}) {
   // tests, and setups this reading doesn't fit, turn it off
-  if (env.AGY_BRIDGE_STORED_SIGNIN === "skip") return { state: "unknown" }
+  if (env.AGY_BRIDGE_STORED_SIGNIN === "skip" || env.FAKE_AGY_LOG) return { state: "unknown" }
   // agy signs in with these instead of a stored Google sign-in
   if (ENV_SIGN_INS.some((name) => env[name])) return { state: "unknown" }
+  const file = readTokenFile(resolveHome(env, home), now)
+  if (env.AGY_BRIDGE_STORED_SIGNIN === "file") return file ?? { state: "missing" }
   if (platform === "darwin") {
-    const r = await exec("/usr/bin/security", ["find-generic-password", "-s", SERVICE, "-a", USER, "-w"])
-    // 44: errSecItemNotFound
+    // Omit `-w`: decrypting the secret payload written by Go's go-keyring triggers
+    // macOS Keychain ACL prompts or fails with errSecInteractionNotAllowed when
+    // `/usr/bin/security` is not on the item's partition ACL. Item attributes
+    // (`mdat`, `acct`, `svce`) are public, never prompt, and change hash on re-login.
+    const r = await exec("/usr/bin/security", ["find-generic-password", "-s", SERVICE, "-a", USER])
+    if (r.code === 0) {
+      const parsed = parseStored(r.stdout, now)
+      if (parsed.state === "present") {
+        if (cannotSignIn(parsed) && file?.state === "present" && !cannotSignIn(file)) return file
+        return { ...parsed, fp: combineFp(parsed.fp, file) }
+      }
+      if (parsed.state === "missing") return file?.state === "present" ? file : { state: "missing" }
+      const attr = String(r.stdout ?? "").trim()
+      if (DARWIN_KEYCHAIN_ATTR_RE.test(attr)) {
+        const attrFp = createHash("sha256").update(attr).digest("hex").slice(0, 32)
+        return { state: "present", fp: combineFp(attrFp, file), canRenew: true, expiresAt: 0, expired: false }
+      }
+    }
+    if (file?.state === "present") return file
+    if (file?.state === "unknown") return { state: "unknown" }
+    // 44: errSecItemNotFound (and no usable antigravity-oauth-token fallback)
     if (r.code === 44) return { state: "missing" }
-    if (r.code !== 0) return { state: "unknown" }
-    return parseStored(r.stdout, now)
+    return { state: "unknown" }
   }
   if (platform === "win32") {
-    const r = await exec("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", WINDOWS_SCRIPT])
+    // Omit `-ExecutionPolicy Bypass`: inline `-EncodedCommand` is not a `.ps1`
+    // script file so ExecutionPolicy never applies, while passing `Bypass` on
+    // the command line can be stalled or blocked by Windows endpoint security.
+    const r = await exec("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", WINDOWS_ENCODED_SCRIPT])
     // the answer is the last line; anything PowerShell said before it isn't
     const out = r.stdout.trim().split(/\r?\n/).at(-1)?.trim() ?? ""
-    if (r.code !== 0) return { state: "unknown" }
-    if (out === "MISSING") return { state: "missing" }
-    if (!out.startsWith("OK ")) return { state: "unknown" }
-    // go-keyring on Windows stores the value's bytes as they are (UTF-8)
-    return parseStored(Buffer.from(out.slice(3), "base64").toString("utf8"), now)
+    if (r.code === 0 && out.startsWith("OK ")) {
+      // go-keyring on Windows stores the value's bytes as they are (UTF-8)
+      const parsed = parseStored(Buffer.from(out.slice(3), "base64").toString("utf8"), now)
+      if (parsed.state === "present") {
+        if (cannotSignIn(parsed) && file?.state === "present" && !cannotSignIn(file)) return file
+        return { ...parsed, fp: combineFp(parsed.fp, file) }
+      }
+      if (file?.state === "present") return file
+      return parsed
+    }
+    if (file?.state === "present") return file
+    if (file?.state === "unknown") return { state: "unknown" }
+    if (r.code === 0 && out === "MISSING") return { state: "missing" }
+    return { state: "unknown" }
   }
+  // Linux agy may keep credentials in DBus Secret Service rather than the token
+  // file, so an absent or expired file never proves agy is signed out.
+  if (file?.state === "present" && !cannotSignIn(file)) return file
   return { state: "unknown" }
 }
 
