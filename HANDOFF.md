@@ -1,3 +1,8 @@
+## 2026-11-14：隔离桥接 `agy acp` 数据目录，消除 Magpie 双重计数（v0.3.2）
+
+- **根因**：客户端（如 Claude Code）经 Magpie 网关调用本插件时，网关先按客户端（`agent: "claude"`）记录一次请求用量；同时插件启动的 `agy acp` 默认把会话日志与 SQLite 库写进 `~/.gemini/antigravity-cli/{brain,conversations}`。Magpie 开启 `Antigravity CLI` 本地会话读取后，`internal/usage/match_chunks.go` 仅对网关侧同为 `agy`/`antigravity` 且无 session ID 的记录去重，无法关联 Claude Code 等外部客户端借道产生的请求，导致同一批调用被当成「未走网关的 Antigravity CLI」重复统计，并污染终端 `agy -c` 续接记录。
+- **修复**：`index.mjs` 在 `Proc.start()` 默认为 `agy acp` 传入 `--app-data-dir magpie-agy-bridge`（落盘到 `~/.gemini/magpie-agy-bridge`，Magpie 本地扫描仅固定读取 `~/.gemini/antigravity-cli`，支持 `AGY_BRIDGE_APP_DATA_DIR` 覆盖或设 `0` 关闭），将 `sessionDbFile` 的 SQLite `gen_metadata` 用量读取对齐到隔离目录，并在启动/登录/切号前后通过 `syncBridgeTokenFile` 双向同步 `antigravity-oauth-token`（保留同账号令牌刷新、响应多账号切换与登出清理，macOS/Windows 系统凭据库无文件时零副作用）。插件初始化时通过一次性哨兵 `.migrated-legacy-v1` 在后台将 `~/.gemini/antigravity-cli` 中带 `magpie-agy-bridge-` 特征的历史桥接会话迁入 `~/.gemini/magpie-agy-bridge`，不动用户真实终端 `agy` 会话。新增 `test-appdata.mjs` 4 项回归单测。
+
 ## 2026-11-14：修复 macOS 本地凭证识别与登录态误判过期（v0.3.1）
 
 - **根因**：`v0.3.0` 合入上游 `signin.mjs` + `usage.mjs` 后存在三处联动问题：①macOS 下 `readStoredSignIn`

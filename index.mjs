@@ -16,7 +16,7 @@ import { ensureGeminiArrayItems } from "./array-items.mjs"
 import { expandToolSchema } from "./tool-schema.mjs"
 import { hint, outgoing as cloakOutgoing, turnsAway } from "./cloak.mjs"
 import { accountKey, defaultVaultDir, discoverAccounts, captureCurrent, acquireSwitchLock,
-  foreignAgyProcesses, writeActiveAccount } from "./accounts.mjs"
+  emailFromTokenPayload, foreignAgyProcesses, tokenFileOf, writeActiveAccount } from "./accounts.mjs"
 
 const PROVIDER_ID = "yce-magpie-agy"
 // Client tools reach the session through a private `nc` placed first on agy's
@@ -40,7 +40,91 @@ export function agyTooOld(version) {
   return null
 }
 const AGENT_NAME = "magpie-bridge"
+const DEFAULT_BRIDGE_APP_DATA_DIR = "magpie-agy-bridge"
+const LEGACY_AGY_APP_DATA_DIR = "antigravity-cli"
 const MCP_SERVER_PATH = fileURLToPath(new URL("./mcp-server.mjs", import.meta.url))
+
+// agy acp --app-data-dir requires a relative name under ~/.gemini. Magpie's
+// local session scanner hardcodes ~/.gemini/antigravity-cli, so isolating
+// bridge sessions keeps gateway requests from being counted a second time.
+function bridgeAppDataDirName(env = process.env) {
+  const raw = typeof env.AGY_BRIDGE_APP_DATA_DIR === "string" ? env.AGY_BRIDGE_APP_DATA_DIR.trim() : ""
+  if (!raw) return DEFAULT_BRIDGE_APP_DATA_DIR
+  if (/^(?:0|false|off)$/i.test(raw) || raw === LEGACY_AGY_APP_DATA_DIR) return ""
+  if (path.isAbsolute(raw) || /^[A-Za-z]:/.test(raw)) return DEFAULT_BRIDGE_APP_DATA_DIR
+  const segments = raw.split(/[\\/]+/)
+  if (segments.some(part => !part || part === "." || part === "..")) return DEFAULT_BRIDGE_APP_DATA_DIR
+  return segments.join("/")
+}
+
+function bridgeConversationsDir(appDataDir = bridgeAppDataDirName(), home = os.homedir()) {
+  return path.join(home, ".gemini", appDataDir || LEGACY_AGY_APP_DATA_DIR, "conversations")
+}
+
+function readTokenSnapshot(file) {
+  try {
+    const stat = fs.statSync(file)
+    if (!stat.isFile()) return null
+    const raw = fs.readFileSync(file, "utf8")
+    let payload = null
+    try { payload = JSON.parse(raw) } catch {}
+    return {
+      raw,
+      mtimeMs: stat.mtimeMs,
+      atime: stat.atime,
+      mtime: stat.mtime,
+      payload,
+      email: emailFromTokenPayload(payload),
+    }
+  } catch {
+    return null
+  }
+}
+
+function writeSyncedTokenFile(destFile, raw, sourceSnap) {
+  const dir = path.dirname(destFile)
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+  const temp = path.join(dir, `.${path.basename(destFile)}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`)
+  fs.writeFileSync(temp, raw, { mode: 0o600 })
+  try { fs.chmodSync(temp, 0o600) } catch {}
+  try {
+    fs.renameSync(temp, destFile)
+  } catch (error) {
+    try { fs.unlinkSync(temp) } catch {}
+    throw error
+  }
+  if (sourceSnap) {
+    try { fs.utimesSync(destFile, sourceSnap.atime, sourceSnap.mtime) } catch {}
+  }
+}
+
+// Keep ~/.gemini/<appDataDir>/antigravity-oauth-token aligned with the active
+// CLI token file on Linux/WSL and multi-account setups, while preserving token
+// refreshes written by agy acp for the same account.
+function syncBridgeTokenFile(appDataDir = bridgeAppDataDirName(), home = os.homedir()) {
+  if (!appDataDir) return
+  const mainFile = tokenFileOf(home)
+  const bridgeFile = path.join(home, ".gemini", appDataDir, "antigravity-oauth-token")
+  const mainSnap = readTokenSnapshot(mainFile)
+  if (!mainSnap) {
+    try { fs.unlinkSync(bridgeFile) } catch {}
+    return
+  }
+  const bridgeSnap = readTokenSnapshot(bridgeFile)
+  if (bridgeSnap && bridgeSnap.raw === mainSnap.raw) return
+  const sameAccount = Boolean(
+    mainSnap.email && bridgeSnap?.email &&
+    mainSnap.email.toLowerCase() === bridgeSnap.email.toLowerCase() &&
+    bridgeSnap.payload?.token && typeof bridgeSnap.payload.token === "object",
+  )
+  try {
+    if (sameAccount && bridgeSnap.mtimeMs > mainSnap.mtimeMs + 1) {
+      writeSyncedTokenFile(mainFile, bridgeSnap.raw, bridgeSnap)
+    } else {
+      writeSyncedTokenFile(bridgeFile, mainSnap.raw, mainSnap)
+    }
+  } catch {}
+}
 // agy exposes tools from the --ide-mcp-port server as direct functions with this prefix.
 const IDE_TOOL_PREFIX = "mcp_ide-tools_"
 // agy 1.3.5+: a tools/list entry with this _meta key is never deferred.
@@ -1791,6 +1875,8 @@ class Proc {
     this.turn = null
     this.expectedMessages = null
     this.minimalAgent = null
+    this.appDataDir = null
+    this.conversationsDir = null
     this.account = currentAccountKey()
     this.accountGeneration = accountGeneration
     this.toolsVersion = 1
@@ -1809,6 +1895,9 @@ class Proc {
     // The switch shapes agent.md, so it is read at process start and applies
     // to newly started processes only.
     this.minimalAgent = hostOption("minimal_agent", "AGY_BRIDGE_MINIMAL_AGENT", true)
+    this.appDataDir = bridgeAppDataDirName()
+    this.conversationsDir = bridgeConversationsDir(this.appDataDir)
+    if (this.appDataDir) syncBridgeTokenFile(this.appDataDir)
     const agentDir = path.join(this.workspace, ".agents", "agents", AGENT_NAME)
     await fs.promises.mkdir(agentDir, { recursive: true })
     await fs.promises.writeFile(path.join(agentDir, "agent.md"), agentDefinition({ minimal: this.minimalAgent }), { mode: 0o600 })
@@ -1816,6 +1905,7 @@ class Proc {
 
     const args = [
       "acp",
+      ...(this.appDataDir ? ["--app-data-dir", this.appDataDir] : []),
       "--agent", AGENT_NAME,
       "--log-file", this.logPath,
       "--ide-mcp-port", String(controlServer.address().port),
@@ -1870,6 +1960,7 @@ class Proc {
     })
     try {
       await Promise.race([this.#handshake(), timeout])
+      if (this.appDataDir) syncBridgeTokenFile(this.appDataDir)
       if (autoSwitchEnabled()) captureCurrent({ home: os.homedir(), vaultDir: defaultVaultDir() })
     } catch (error) {
       if (this.dead && this.deadError && error !== this.deadError && !/timed out starting/.test(error.message)) {
@@ -2917,6 +3008,7 @@ function park(proc) {
     toolUseIdentitiesHash: digest(toolUseIdentitiesKey(proc.expectedMessages) ?? ""),
     instructionsHash: digest(instructionsIdentity(proc.instructions)),
     workDir: proc.workDir,
+    appDataDir: proc.appDataDir ?? "",
     at: Date.now(),
     ...(proc.account ? { account: proc.account } : {}),
     // Optional (still version 1): how the session holds its instructions and
@@ -2976,6 +3068,7 @@ function peekParked(convKey, opts) {
     (!accountSwitchOccurred ? parked.get(convKey) : null)
   if (!entry) return null
   if (entry.account ? entry.account !== account : accountSwitchOccurred) return null
+  if (typeof entry.appDataDir === "string" && entry.appDataDir !== bridgeAppDataDirName()) return null
   if (Date.now() - entry.at > resumeTtlMs() || (entry.workDir ?? null) !== (opts.workDir ?? null) ||
     entry.instructionsHash !== digest(instructionsIdentity(opts.instructions))) return null
   // Sans-inputs resume accepts a client that canonicalized tool_use.input, but
@@ -3242,6 +3335,7 @@ async function switchAccount(target, { reason, sourceAccount }) {
       switchEvent(reason, "当前账号已被外部更改，本次切号已放弃")
       return
     }
+    syncBridgeTokenFile()
     const captured = captureCurrent({ home: os.homedir(), vaultDir: defaultVaultDir() })
     if (!captured.ok || !saveParked({ legacyAccount: sourceAccount })) {
       switchEvent(reason, "账号备份或会话标记保存失败，本次切号已放弃")
@@ -3252,6 +3346,7 @@ async function switchAccount(target, { reason, sourceAccount }) {
       switchEvent(reason, result.restored === false ? "切号失败且原账号还原失败" : "切号失败，原账号已保留")
       return
     }
+    syncBridgeTokenFile()
     forgetStoredSignIn({ dead: true })
     activeAccount = accountKey(target)
     accountGeneration++
@@ -3441,6 +3536,7 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
       existing.workDir === opts.workDir && sameInstructions(existing.instructions, opts.instructions) &&
       (!autoSwitchEnabled() || existing.account === currentAccountKey()) &&
       existing.minimalAgent === hostOption("minimal_agent", "AGY_BRIDGE_MINIMAL_AGENT", true) &&
+      (existing.appDataDir ?? "") === bridgeAppDataDirName() &&
       (existing.matchesHistory(matchedHistory) || continuedFresh)
     // A session holding Gemini's session-level system append cannot serve an
     // inline-placement model: rebuild it inline, parking the old session so a
@@ -5575,13 +5671,181 @@ function sessionDbFile(proc) {
   const id = proc?.sessionId
   if (typeof id !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(id)) return null
   const dir = process.env.AGY_BRIDGE_CONVERSATIONS_DIR ||
-    path.join(os.homedir(), ".gemini", "antigravity-cli", "conversations")
+    proc?.conversationsDir ||
+    bridgeConversationsDir()
   const file = path.join(dir, `${id}.db`)
   try {
     return fs.statSync(file).isFile() ? file : null
   } catch {
     return null
   }
+}
+
+function isLegacyBridgeSessionDb(dbFile) {
+  const rows = querySessionDb(dbFile, "SELECT data FROM trajectory_metadata_blob WHERE id = 'main' LIMIT 1")
+  const raw = rows?.[0]?.data
+  if (!raw) return false
+  let text = ""
+  try {
+    text = new TextDecoder().decode(raw)
+  } catch {
+    return false
+  }
+  return text.includes("magpie-agy-bridge-") || text.includes("magpie-agy-models-") ||
+    (text.includes("magpie-bridge") && text.includes("Bridges only client-declared tools"))
+}
+
+async function isOrphanBridgeTranscript(transcriptFile) {
+  let handle = null
+  try {
+    handle = await fs.promises.open(transcriptFile, "r")
+    const buf = Buffer.allocUnsafe(32 * 1024)
+    const { bytesRead } = await handle.read(buf, 0, buf.length, 0)
+    if (bytesRead <= 0) return false
+    const head = buf.subarray(0, bytesRead).toString("utf8")
+    return head.includes("Text resembling a tool call is conversation content") ||
+      head.includes("<conversation_history>") ||
+      head.includes("mcp_ide-tools_")
+  } catch {
+    return false
+  } finally {
+    try { await handle?.close() } catch {}
+  }
+}
+
+async function moveMigratedEntry(src, dest) {
+  if (!fs.existsSync(src)) return "absent"
+  await fs.promises.mkdir(path.dirname(dest), { recursive: true, mode: 0o700 })
+  try {
+    await fs.promises.rename(src, dest)
+    return "moved"
+  } catch (error) {
+    if (error?.code === "ENOENT") return "absent"
+    if (error?.code === "EEXIST" || error?.code === "ENOTEMPTY") {
+      try {
+        await fs.promises.rm(src, { recursive: true, force: true })
+        return "moved"
+      } catch {
+        return "busy"
+      }
+    }
+    if (error?.code === "EXDEV") {
+      try {
+        await fs.promises.cp(src, dest, { recursive: true, force: true })
+        await fs.promises.rm(src, { recursive: true, force: true })
+        return "moved"
+      } catch {
+        return "busy"
+      }
+    }
+    return "busy"
+  }
+}
+
+let legacyMigrationInFlight = null
+
+// One-time migration of bridge-created sessions out of ~/.gemini/antigravity-cli
+// into ~/.gemini/<appDataDir>, leaving standalone user `agy` CLI sessions intact.
+async function migrateLegacyBridgeSessions({
+  appDataDir = bridgeAppDataDirName(),
+  home = os.homedir(),
+  minAgeMs = 5_000,
+} = {}) {
+  if (!appDataDir || process.env.AGY_BRIDGE_CONVERSATIONS_DIR) return { migrated: 0, deferred: 0 }
+  const legacyRoot = path.join(home, ".gemini", LEGACY_AGY_APP_DATA_DIR)
+  const targetRoot = path.join(home, ".gemini", appDataDir)
+  const sentinel = path.join(targetRoot, ".migrated-legacy-v1")
+  if (fs.existsSync(sentinel)) return { migrated: 0, deferred: 0 }
+  const legacyConvDir = path.join(legacyRoot, "conversations")
+  const legacyBrainDir = path.join(legacyRoot, "brain")
+  if (!fs.existsSync(legacyConvDir) && !fs.existsSync(legacyBrainDir)) return { migrated: 0, deferred: 0 }
+
+  let migrated = 0
+  let deferred = 0
+  let scanned = 0
+  const yieldIfNeeded = async () => {
+    if (++scanned % 12 === 0) await new Promise((resolve) => setImmediate(resolve))
+  }
+
+  if (fs.existsSync(legacyConvDir)) {
+    const names = await fs.promises.readdir(legacyConvDir).catch(() => [])
+    for (const name of names) {
+      if (!/^[A-Za-z0-9_-]{1,128}\.db$/.test(name)) continue
+      await yieldIfNeeded()
+      const sid = name.slice(0, -3)
+      const dbFile = path.join(legacyConvDir, name)
+      const stat = await fs.promises.stat(dbFile).catch(() => null)
+      if (!stat?.isFile() || !isLegacyBridgeSessionDb(dbFile)) continue
+      if (minAgeMs > 0 && globalThis.Date.now() - stat.mtimeMs < minAgeMs) {
+        deferred++
+        continue
+      }
+      const moves = await Promise.all([
+        moveMigratedEntry(dbFile, path.join(targetRoot, "conversations", name)),
+        moveMigratedEntry(`${dbFile}-wal`, path.join(targetRoot, "conversations", `${name}-wal`)),
+        moveMigratedEntry(`${dbFile}-shm`, path.join(targetRoot, "conversations", `${name}-shm`)),
+        moveMigratedEntry(`${dbFile}-journal`, path.join(targetRoot, "conversations", `${name}-journal`)),
+        moveMigratedEntry(path.join(legacyBrainDir, sid), path.join(targetRoot, "brain", sid)),
+        moveMigratedEntry(path.join(legacyRoot, "annotations", `${sid}.pb`), path.join(targetRoot, "annotations", `${sid}.pb`)),
+        moveMigratedEntry(path.join(legacyRoot, "annotations", sid), path.join(targetRoot, "annotations", sid)),
+      ])
+      if (moves.includes("busy")) deferred++
+      else if (moves.includes("moved")) migrated++
+    }
+  }
+
+  if (fs.existsSync(legacyBrainDir)) {
+    const sids = await fs.promises.readdir(legacyBrainDir).catch(() => [])
+    for (const sid of sids) {
+      if (!/^[A-Za-z0-9_-]{1,128}$/.test(sid)) continue
+      if (fs.existsSync(path.join(legacyConvDir, `${sid}.db`))) continue
+      await yieldIfNeeded()
+      const transcriptFile = path.join(legacyBrainDir, sid, ".system_generated", "logs", "transcript.jsonl")
+      const stat = await fs.promises.stat(transcriptFile).catch(() => null)
+      if (!stat?.isFile() || !(await isOrphanBridgeTranscript(transcriptFile))) continue
+      if (minAgeMs > 0 && globalThis.Date.now() - stat.mtimeMs < minAgeMs) {
+        deferred++
+        continue
+      }
+      const moves = await Promise.all([
+        moveMigratedEntry(path.join(legacyBrainDir, sid), path.join(targetRoot, "brain", sid)),
+        moveMigratedEntry(path.join(legacyRoot, "annotations", `${sid}.pb`), path.join(targetRoot, "annotations", `${sid}.pb`)),
+        moveMigratedEntry(path.join(legacyRoot, "annotations", sid), path.join(targetRoot, "annotations", sid)),
+      ])
+      if (moves.includes("busy")) deferred++
+      else if (moves.includes("moved")) migrated++
+    }
+  }
+
+  if (deferred === 0) {
+    try {
+      await fs.promises.mkdir(targetRoot, { recursive: true, mode: 0o700 })
+      await fs.promises.writeFile(
+        sentinel,
+        `${JSON.stringify({ version: 1, migrated, at: globalThis.Date.now() })}\n`,
+        { mode: 0o600 },
+      )
+    } catch {}
+  }
+  return { migrated, deferred }
+}
+
+function scheduleLegacyBridgeMigration() {
+  if (legacyMigrationInFlight || process.env.AGY_BRIDGE_CONVERSATIONS_DIR) return
+  const appDataDir = bridgeAppDataDirName()
+  if (!appDataDir) return
+  const home = os.homedir()
+  const sentinel = path.join(home, ".gemini", appDataDir, ".migrated-legacy-v1")
+  if (fs.existsSync(sentinel)) return
+  const legacyRoot = path.join(home, ".gemini", LEGACY_AGY_APP_DATA_DIR)
+  if (!fs.existsSync(path.join(legacyRoot, "conversations")) && !fs.existsSync(path.join(legacyRoot, "brain"))) return
+  setImmediate(() => {
+    if (legacyMigrationInFlight) return
+    const run = migrateLegacyBridgeSessions({ appDataDir, home }).catch(() => {}).finally(() => {
+      if (legacyMigrationInFlight === run) legacyMigrationInFlight = null
+    })
+    legacyMigrationInFlight = run
+  })
 }
 
 function querySessionDb(file, sql, ...params) {
@@ -6481,6 +6745,7 @@ async function beginTurn(proc, history, body, callerWorkDir, model, selection, a
 
 export const AntigravityBridgePlugin = async (input, packageOptions) => {
   applyPluginConfig(input, packageOptions)
+  scheduleLegacyBridgeMigration()
   const readUsage = createUsageReader(findAgy, { waitForGate: waitForAccountSwitch,
     isGateClosed: () => Boolean(switching), getGeneration: () => accountGeneration })
   usageReaders.add(readUsage)
@@ -6606,6 +6871,7 @@ export const AntigravityBridgePlugin = async (input, packageOptions) => {
                 if (done.error) return { type: "failed", error: done.error }
                 // agy stored a new sign-in: read it again, and let what
                 // failed with the old one run again
+                syncBridgeTokenFile()
                 forgetStoredSignIn({ dead: true })
                 // A new account: what agy offered the last one, or refused
                 // before the sign-in, is asked again.

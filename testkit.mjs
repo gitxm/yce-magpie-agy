@@ -44,7 +44,8 @@ const RUNTIME_PRELUDE = `import { ${RUNTIME_NAMES.join(", ")} } from ${JSON.stri
 const TEST_EXPORTS = "\nexport { Turn as __agyTestTurn, allProcs as __agyTestAllProcs, pool as __agyTestPool, " +
   "execOnce as __agyTestExecOnce, findAgy as __agyTestFindAgy, canonicalBody as __agyTestCanonicalBody, " +
   "conversationKey as __agyTestConversationKey, renderInitialPromptParts as __agyTestRenderInitialPromptParts, " +
-  "scheduleAccountSwitch as __agyTestScheduleAccountSwitch };\n"
+  "scheduleAccountSwitch as __agyTestScheduleAccountSwitch, bridgeAppDataDirName as __agyTestBridgeAppDataDirName, " +
+  "syncBridgeTokenFile as __agyTestSyncBridgeTokenFile, migrateLegacyBridgeSessions as __agyTestMigrateLegacyBridgeSessions };\n"
 const IDENTIFIER_RE = /^[A-Za-z_$][\w$]*$/
 
 // Synthetic credentials only. Never defaults to the developer's home.

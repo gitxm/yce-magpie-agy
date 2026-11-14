@@ -180,6 +180,7 @@ measurable data shows "Limits not available" rather than a fake 0% or 100%.
 | `AGY_BRIDGE_MINIMAL_AGENT` | on | Set to `0` to keep agy's default prompt components (about 2,600 more input tokens per model call); on new Magpie builds the Providers page switch takes precedence, only older hosts read this variable |
 | `AGY_BRIDGE_IDLE_MS` | 600000 | How long a process may sit idle before it is reclaimed; the session can still resume |
 | `AGY_BRIDGE_RESUME_TTL_MS` | 21600000 | How long a reclaimed session stays resumable (6 hours) |
+| `AGY_BRIDGE_APP_DATA_DIR` | `magpie-agy-bridge` | Isolated `~/.gemini/<name>` app-data directory passed to `agy acp` so Magpie's local `Antigravity CLI` session scanner does not double-count gateway calls or pollute terminal `agy -c`; set to `0` or `antigravity-cli` to share the CLI directory |
 | `AGY_BRIDGE_STATE_FILE` | `$XDG_STATE_HOME/magpie-agy-bridge/sessions.json` | Where resumable session records are kept |
 | `AGY_BRIDGE_IDE_CALL_DEADLINE_MS` | 150000 | After this long, a still-running client tool gets a "still running" reply |
 | `AGY_BRIDGE_START_TIMEOUT_MS` / `_TURN_TIMEOUT_MS` / `_TOOL_TIMEOUT_MS` | 60 s / 5 min / 30 min | Limits for process startup, agy silence, and waiting on a client tool result |

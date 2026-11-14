@@ -457,8 +457,11 @@ function encodeGenMetadataBlob({ model = 1007, input = 0, output = 0, write = 0,
   return protoBytesField(1, Buffer.concat(innerParts))
 }
 
-function conversationsPath(kit, sessionId) {
-  const dir = kit.env.AGY_BRIDGE_CONVERSATIONS_DIR || path.join(kit.home, ".gemini", "antigravity-cli", "conversations")
+function conversationsPath(kit, sessionId, agy = null) {
+  const args = agy?.child?.args || []
+  const idx = args.indexOf("--app-data-dir")
+  const appDataDir = idx >= 0 && args[idx + 1] ? args[idx + 1] : "magpie-agy-bridge"
+  const dir = kit.env.AGY_BRIDGE_CONVERSATIONS_DIR || path.join(kit.home, ".gemini", appDataDir, "conversations")
   fs.mkdirSync(dir, { recursive: true })
   return path.join(dir, `${sessionId}.db`)
 }

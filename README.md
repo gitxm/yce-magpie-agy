@@ -150,6 +150,7 @@ magpie quota refresh yce-magpie-agy --json
 | `AGY_BRIDGE_MINIMAL_AGENT` | 开启 | 设为 `0` 保留 agy 默认提示组件，每次模型调用多约 2,600 个输入 token；新版 Magpie 以 Providers 页开关为准，旧宿主才读该环境变量 |
 | `AGY_BRIDGE_IDLE_MS` | 600000 | 进程空闲多久后回收（会话仍可续接） |
 | `AGY_BRIDGE_RESUME_TTL_MS` | 21600000 | 回收后的会话可续接的时长（6 小时） |
+| `AGY_BRIDGE_APP_DATA_DIR` | `magpie-agy-bridge` | 插件启动 `agy acp` 使用的 `~/.gemini/<名称>` 独立数据目录（避免 Magpie 本地 `Antigravity CLI` 会话扫描与网关请求重复计数，也不污染终端 `agy -c`）；设为 `0` 或 `antigravity-cli` 可回退共用目录 |
 | `AGY_BRIDGE_STATE_FILE` | `$XDG_STATE_HOME/magpie-agy-bridge/sessions.json` | 会话状态文件路径 |
 | `AGY_BRIDGE_IDE_CALL_DEADLINE_MS` | 150000 | 工具运行超过该时间仍未结束时，先返回 "still running" |
 | `AGY_BRIDGE_START_TIMEOUT_MS` / `_TURN_TIMEOUT_MS` / `_TOOL_TIMEOUT_MS` | 60 秒 / 5 分钟 / 30 分钟 | 进程启动、agy 无输出、等待客户端工具结果的超时 |
