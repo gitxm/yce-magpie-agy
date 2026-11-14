@@ -1,0 +1,8 @@
+{
+  "upstreamRepo": "https://github.com/magpie-community/plugins.git",
+  "upstreamBranch": "main",
+  "upstreamPath": "packages/agy-cli",
+  "cloakPath": "packages/antigravity-cloak",
+  "syncedCommit": "4f5d4138ad51b1d40a5b591bbb022941734412bf",
+  "syncedVersion": "0.1.39"
+}

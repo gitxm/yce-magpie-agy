@@ -1234,19 +1234,22 @@ let nativeConv
 }
 
 for (const change of ["tools", "model"]) {
-  const first = { model, messages: [{ role: "user", content: `TOOL live configuration ${change}` }], tools: [echoTool] }
+  const other = { name: "other", input_schema: { type: "object" } }
+  const first = { model, messages: [{ role: "user", content: `TOOL live configuration ${change}` }], tools: change === "tools" ? [echoTool, other] : [echoTool] }
   const events = (await readSSE(await callFetch(first))).events
   const old = inits().at(-1)
   const second = continuation(first, events, "completed-before-change")
   if (change === "tools") {
-    second.tools = [...second.tools, { name: "other", input_schema: { type: "object" } }]
+    // A catalog that only loses tools keeps the live turn; one that grows
+    // starts a new prompt (the #942 block below).
+    second.tools = [echoTool]
     second.messages.push({ role: "user", content: [{ type: "text", text: "<system-update>tool catalog changed</system-update>" }] })
   } else second.model = legacyModel
   const final = (await readSSE(await callFetch(second))).events
   const delivered = logs().filter(event => event.type === "mcpResult" && event.convId === old.convId).at(-1)
   check(`live ${change} change continues the pending turn`, stopOf(final) === "end_turn" && inits().at(-1).convId === old.convId && delivered?.result?.content?.[0]?.text === "completed-before-change")
   if (change === "tools") {
-    check("live tool change reaches agy", logs().some(event => event.type === "toolsList" && event.convId === old.convId && event.tools.includes("other")))
+    check("live tool change reaches agy", logs().some(event => event.type === "toolsList" && event.reason === "list_changed" && event.convId === old.convId && event.tools.includes("echo") && !event.tools.includes("other")))
     check("system update reaches the pending MCP result", delivered?.result?.content?.some(part => part.text?.includes("tool catalog changed")))
   } else {
     const next = (await readSSE(await callFetch({ ...nextTurn(second, final, "MODEL next prompt"), model: legacyModel }))).events
@@ -1402,23 +1405,18 @@ for (const change of ["tools", "model"]) {
 {
   const firstBody = { model, messages: [{ role: "user", content: "TOOL extra text" }], tools: [echoTool] }
   const firstEvents = (await readSSE(await callFetch(firstBody))).events
-  const invalidBody = continuation(firstBody, firstEvents, "result", { extraText: true })
-  invalidBody.messages.at(-1).content.at(-1).text += "\n<task-notification>background completed</task-notification>"
-  const beforeResult = continuation(firstBody, firstEvents, "result")
-  beforeResult.messages.at(-1).content.unshift({ type: "text", text: "<task-notification>too early</task-notification>" })
-  const hookAndUser = continuation(firstBody, firstEvents, "result")
-  hookAndUser.messages.at(-1).content.push({ type: "text", text: "PreToolUse:Read hook additional context: hook output\n\nThe user sent a new message while you were working:\nstop now" })
-  const systemBeforeResult = continuation(firstBody, firstEvents, "result")
-  systemBeforeResult.messages.at(-1).content.unshift({ type: "text", text: "<system-update>too early</system-update>" })
-  const systemAndUser = continuation(firstBody, firstEvents, "result")
-  systemAndUser.messages.at(-1).content.push({ type: "text", text: "<system-update>catalog changed</system-update>\n\nordinary user instruction" })
+  // User text and notices beside a live tool_result are replayed as prompt
+  // content now (#951, #1052); only a protocol notice that opens and is cut
+  // short is still refused.
   const unclosedSystem = continuation(firstBody, firstEvents, "result")
   unclosedSystem.messages.at(-1).content.push({ type: "text", text: "<system-update>not a complete protocol notice" })
-  const rejected = await Promise.all([invalidBody, beforeResult, hookAndUser, systemBeforeResult, systemAndUser, unclosedSystem].map(body => callFetch(body)))
-  check("unsupported user text and malformed or pre-result notices return 400", rejected.every(response => response.status === 400), rejected.map(response => response.status).join(","))
+  const rejected = await callFetch(unclosedSystem)
+  check("unclosed protocol notices beside tool results still return 400", rejected.status === 400, `got ${rejected.status}`)
+  if (rejected.status !== 200) await rejected.text()
   const validBody = continuation(firstBody, firstEvents, "result")
-  const validEvents = (await readSSE(await callFetch(validBody))).events
-  check("valid result can continue after rejected extra text", stopOf(validEvents) === "end_turn")
+  const validRes = await callFetch(validBody)
+  const validEvents = validRes.status === 200 ? (await readSSE(validRes)).events : []
+  check("valid result can continue after rejected malformed notice", validRes.status === 200 && stopOf(validEvents) === "end_turn")
 }
 
 for (const location of ["inline", "system", "developer", "user"]) {
@@ -1900,6 +1898,7 @@ for (const location of ["inline", "system", "developer", "user"]) {
   const first = { model, messages: [{ role: "user", content: "ESCCALL interrupted by user" }], tools: [echoTool] }
   const events = (await readSSE(await callFetch(first))).events
   const old = inits().at(-1)
+  const initsBefore = inits().length
   const second = continuation(first, events, "partial tool output")
   second.messages.at(-1).content.push(
     { type: "text", text: "[Request interrupted by user]\n" },
@@ -1908,13 +1907,14 @@ for (const location of ["inline", "system", "developer", "user"]) {
   const response = await callFetch(second)
   const final = (await readSSE(response)).events
   const replay = lastOf("user")
-  check("user-interrupted tool turn abandons old process and starts new turn cleanly",
-    response.status === 200 && stopOf(final) === "end_turn" && replay.convId !== old.convId &&
-    replay.text.includes("New instruction after Esc") && !fs.existsSync(old.cwd), `got ${response.status}`)
+  check("a user-interrupted tool turn keeps the live agy session: no session/new, the steer is the next prompt",
+    response.status === 200 && stopOf(final) === "end_turn" && replay.convId === old.convId &&
+    inits().length === initsBefore && replay.text.includes("New instruction after Esc") && fs.existsSync(old.cwd),
+    `got ${response.status} {replay:${replay.convId}, old:${old.convId}, n:${inits().length}, before:${initsBefore}}`)
   const third = nextTurn(second, final, "MEMORY after interrupted tool turn")
   const thirdRes = await callFetch(third)
   await readSSE(thirdRes)
-  check("turn after user-interrupted replay reuses the new session",
+  check("turn after a user-interrupted tool turn reuses the same session",
     thirdRes.status === 200 && lastOf("user").convId === replay.convId)
 }
 
@@ -2054,6 +2054,7 @@ for (const location of ["inline", "system", "developer", "user"]) {
   const first = { model, messages: [{ role: "user", content: "ESCCALL queued command mid-turn" }], tools: [echoTool] }
   const events = (await readSSE(await callFetch(first))).events
   const old = inits().at(-1)
+  const initsBefore = inits().length
   const second = continuation(first, events, "file-output")
   second.messages.at(-1).content.push(
     { type: "text", text: "<ide_opened_file>/project/a.ts</ide_opened_file>" },
@@ -2070,8 +2071,8 @@ for (const location of ["inline", "system", "developer", "user"]) {
   const secondRes = await callFetch(second)
   const secondFinal = (await readSSE(secondRes)).events
   const steeredUser = lastOf("user")
-  check("Claude Code mid-turn queued_command and tool_addition replay as clean user prompt",
-    secondRes.status === 200 && stopOf(secondFinal) === "end_turn" && steeredUser.convId !== old.convId &&
+  check("Claude Code mid-turn queued_command and tool_addition steer the same session with a clean user prompt",
+    secondRes.status === 200 && stopOf(secondFinal) === "end_turn" && steeredUser.convId === old.convId && inits().length === initsBefore &&
     steeredUser.text.includes("Remove invalid freejev accounts now") &&
     !steeredUser.text.includes("This is how Claude Code surfaces"),
     JSON.stringify(steeredUser))
@@ -2080,12 +2081,13 @@ for (const location of ["inline", "system", "developer", "user"]) {
   const wFirst = { model, messages: [{ role: "user", content: "ESCCALL wedged follow-up" }], tools: [echoTool] }
   const wEvents = (await readSSE(await callFetch(wFirst))).events
   const wOld = inits().at(-1)
+  const wBefore = inits().length
   const wedged = continuation(wFirst, wEvents, "tool-output-before-abort")
   wedged.messages.push({ role: "user", content: "Standalone follow-up user instruction" })
   const wRes = await callFetch(wedged)
   const wFinal = (await readSSE(wRes)).events
-  check("standalone follow-up user message after aborted tool turn replays instead of wedging with 400",
-    wRes.status === 200 && stopOf(wFinal) === "end_turn" && lastOf("user").convId !== wOld.convId &&
+  check("standalone follow-up user message after aborted tool turn steers the same session instead of wedging with 400",
+    wRes.status === 200 && stopOf(wFinal) === "end_turn" && lastOf("user").convId === wOld.convId && inits().length === wBefore &&
     lastOf("user").text.includes("Standalone follow-up user instruction"),
     `status=${wRes.status}`)
 }
@@ -2134,6 +2136,7 @@ for (const location of ["inline", "system", "developer", "user"]) {
   const rFirst = { model, messages: [{ role: "user", content: "ESCCALL user rejected tool" }], tools: [echoTool] }
   const rEvents = (await readSSE(await callFetch(rFirst))).events
   const rOld = inits().at(-1)
+  const rBefore = inits().length
   const rSecond = continuation(
     rFirst,
     rEvents,
@@ -2143,8 +2146,8 @@ for (const location of ["inline", "system", "developer", "user"]) {
   rSecond.messages.at(-1).content.push({ type: "text", text: "Write to /tmp/safe instead" })
   const rRes = await callFetch(rSecond)
   const rFinal = (await readSSE(rRes)).events
-  check("rejected tool_result merged with follow-up user prompt replays cleanly without 400",
-    rRes.status === 200 && stopOf(rFinal) === "end_turn" && lastOf("user").convId !== rOld.convId &&
+  check("rejected tool_result merged with follow-up user prompt steers the same session without 400",
+    rRes.status === 200 && stopOf(rFinal) === "end_turn" && lastOf("user").convId === rOld.convId && inits().length === rBefore &&
     lastOf("user").text.includes("Write to /tmp/safe instead"),
     `status=${rRes.status}`)
 
@@ -2225,11 +2228,14 @@ for (const location of ["inline", "system", "developer", "user"]) {
   const second = continuation(first, events, 'Launching skill: archive')
   second.messages.at(-1).content.push({ type: 'text', text: 'Stop this task and explain something else' })
   const response = await callFetch(second)
-  check('plain user instructions are not treated as a Skill prompt body', response.status === 400, `got ${response.status}`)
-  if (response.status === 400) {
+  const skillFinal = response.status === 200 ? (await readSSE(response)).events : []
+  check('plain user instructions beside a Skill result steer the turn instead of being read as a Skill body',
+    response.status === 200 && stopOf(skillFinal) === "end_turn" && lastOf("user").text.includes('Stop this task and explain something else'),
+    `got ${response.status}`)
+  if (response.status !== 200) {
     await response.text()
     await drive(first, events, 'cleanup ordinary Skill text')
-  } else await readSSE(response)
+  }
 }
 
 {
@@ -2237,13 +2243,14 @@ for (const location of ["inline", "system", "developer", "user"]) {
     const first = { model, messages: [{ role: 'user', content: `ESCCALL queued envelope ${suffix.length}` }], tools: [echoTool] }
     const events = (await readSSE(await callFetch(first))).events
     const oldId = inits().at(-1).convId
+    const queuedBefore = inits().length
     const second = continuation(first, events, 'queued tool output')
     second.messages.at(-1).content.push({ type: 'text', text: 'The user sent a new message while you were working:\nQUEUED_STEERING_MARKER' + suffix })
     const response = await callFetch(second)
     check(`queued prompt suffix ${suffix.length} is accepted beside a tool result`, response.status === 200, `got ${response.status}`)
     if (response.status === 200) {
       await readSSE(response)
-      check(`queued prompt suffix ${suffix.length} replays as user context in a new session`, lastOf('user').convId !== oldId && lastOf('user').text.includes('QUEUED_STEERING_MARKER'))
+      check(`queued prompt suffix ${suffix.length} steers the live session as user context`, lastOf('user').convId === oldId && inits().length === queuedBefore && lastOf('user').text.includes('QUEUED_STEERING_MARKER'))
     } else {
       await response.text()
       await drive(first, events, 'cleanup queued envelope')

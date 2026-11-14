@@ -29,11 +29,20 @@ GPT-OSS 模型，请求实际由 `agy` 进程完成。
   占位响应，真正的结果送达后继续同一轮对话，每个调用只在客户端执行一次。
 - **会话续接**：每轮结束后记录会话。重启 Magpie 或插件后，只要历史和指令的哈希一致，
   就用 `session/resume` 接上上下文。状态文件只存会话 ID 与哈希，不存消息原文。
-- **隔离运行**：不读取你的全局 MCP 配置。每个 agy 进程使用临时 agent。agy 发起的权限
-  请求（shell、写文件、浏览器等）一律拒绝，真正的操作都在客户端侧完成。
+- **隔离运行**：不读取你的全局 MCP 配置。每个 agy 进程使用临时 agent。agy 为自己的工具
+  （shell、写文件、浏览器等）发起的权限请求一律拒绝；客户端工具经桥接的 `ide-tools` 调用时
+  发起的请求放行一次（agy 1.5.5 起会先问，拒绝会让每个工具失败），真正的操作都在客户端侧完成。
+- **客户端工具始终可见**：工具目录按 agy 的 `antigravity/alwaysLoad` 标记下发，agy 不会把
+  `bash`、`agent` 这类大 schema 工具藏进懒加载、让模型调不到。工具 schema 里的 `$ref`/`allOf`/
+  `oneOf` 会展开，无法用 RE2 表达的正则会被降级成说明文字，缺 `items` 的数组会补全——这几种
+  以前都会让整轮直接报 "Model produced invalid output" 中断。
+- **中途加载的新工具**：Claude Code 的 ToolSearch 在回合中途加工具时，插件会在新会话里重放
+  这一轮，模型下一次能看到新工具，不会卡死在 "undeclared tool"。
 - **Magpie 内直接登录 Google 账号**：在 Magpie 的 Providers 页点击 `Sign in with Google`，
   本机已登录时直接通过；未登录时由 `agy acp --login` 给出 Google 授权链接并在页面内回填授权码，
   在服务器或 Docker 里跑 Magpie 也无需远程桌面（对齐官方 agy-cli 0.1.1）。
+- **未登录时不会在后台拉起 agy**：插件先读本机凭据库，没登录或令牌已失效时，额度查询与模型
+  目录刷新都不启动 agy，避免它自己弹浏览器登录。
 - **额度查看**：在 Magpie 里查看 agy 订阅的用量窗口，仅作展示，额度耗尽时不会自动拦截请求。
 - **Claude Code 子代理可用**：Antigravity 对 Claude Agent SDK 身份的系统提示词（Claude Code
   子代理、`claude -p`、Claude Desktop）回假 429，插件默认在发给 agy 的系统级文本里绕开，
@@ -97,7 +106,12 @@ magpie plugin add ./yce-magpie-agy
 
 - **macOS、Linux**：支持。
 - **原生 Windows**：支持 `.exe`、`.cmd`、`.bat` 的查找与启动，后台更新检查不弹控制台窗口，
-  并支持 `magpie quota`。目前只有命令构造的单元测试，尚未在 Windows 实机完成端到端验证。
+  并支持 `magpie quota`。在 Magpie 自带的 Bun 下，插件会把 MCP 垫片编译成一个无窗口的
+  `nc.exe`（GUI 子系统，不会被 agy 分到控制台），不再闪窗、不留 `conhost.exe`；运行时升级后
+  会顺手清掉同一运行时上一版的旧 `nc.exe` 目录。目前只有命令构造的单元测试，尚未在 Windows
+  实机完成端到端验证。
+- **OpenCode 1.x / 2.x**：`main` 指向 `opencode.mjs`（1.x），`exports["."]` 指向
+  `opencode2.mjs`（2.x 的 `{id, setup}` 形态）。Magpie 走 1.x 面。
 
 ### Windows 原生人工复现步骤（多账号自动切号）
 
@@ -144,9 +158,13 @@ magpie quota refresh yce-magpie-agy --json
 | `AGY_BRIDGE_USAGE_TIMEOUT_MS` | 15000 | 额度查询的总时间预算，最高 18000 |
 | `AGY_BRIDGE_MCP_TRACE` | 未设置 | 把 MCP 通道流量写入指定文件，仅用于排查 |
 | `AGY_BRIDGE_PROMPT_CLOAK` | 开启 | 设为 `0` 关闭假 429 绕过，系统提示词原样发给 agy；新版 Magpie 以 Providers 页开关为准 |
-| `AGY_BRIDGE_EXTRA_CLOAK_WORDS` | 未设置 | 追加需要插入零宽空格的系统提示词敏感词（逗号分隔或 JSON 数组） |
+| `AGY_BRIDGE_EXTRA_CLOAK_WORDS` | 未设置 | 追加需要处理的系统提示词敏感句（逗号分隔或 JSON 数组） |
+| `AGY_BRIDGE_CLOAK_MIDDLEWARE_PATH` | 未设置 | 指定 `middleware-antigravity-cloak` 文件路径，覆盖默认查找位置 |
+| `AGY_BRIDGE_STORED_SIGNIN` | 未设置 | 设为 `skip` 时不读取本机凭据库，后台一律视为「未知登录态」 |
+| `AGY_BRIDGE_MCP_COMMIT_WAIT_MS` | 5000 | 打断工具回合前等待 agy 落盘 MCP 结果的上限，最高 60000 |
 | `AGY_BRIDGE_PREFILL` | 开启 | 设为 `0` 恢复对 assistant 预填尾巴的 400 拒绝 |
 | `AGY_BRIDGE_PREFILL_CARRIER_NOTE` | 英文提示行 | 预填片段渲染时的提示行文本（发给模型） |
+| `AGY_BRIDGE_STEP_USAGE` | 未设置 | 保留键：当前版本用 agy SQLite 的 `gen_metadata` 计费，不读该键 |
 
 ## 插件选项
 
@@ -193,22 +211,49 @@ Antigravity 看到下面这些系统提示词片段时，不管额度还剩多�
 - `You are a Claude agent, built on Anthropic's Claude Agent SDK`：Claude Code 的子代理
   （Agent 工具）、`claude -p` 非交互模式、Claude Desktop 都用这句；
 - `x-anthropic-billing-header`（Claude Code 的计费行）、Codex 给 GPT-5 的身份句、
-  Hermes Agent 旧版默认人设。
+  Hermes Agent 旧版默认人设、oh-my-pi 的 RFC 2119 开头行。
 
 Claude Code 交互主会话用的是另一句身份，所以「主会话能跑 Bash，子代理和 `claude -p` 卡死」
 就是这个原因。2026-11-10 在本机 agy 1.5.1 上实测：同一请求去掉这句即正常调用 Bash，
 保留则一直 429。
 
 插件默认在**发给 agy 的系统级文本**（会话级 append、内联的 `external_system_instructions`、
-`role: system/developer` 消息）里，给这几句的首字母后插一个零宽空格（U+200B），模型读到的
-意思不变。词表与 magpie 的 antigravity-cloak 中间件相同——那个中间件只作用于 magpie 自带的
-Antigravity 账号，管不到本插件。会话标识、续接哈希与用户正文都不改。
+`role: system/developer` 消息）里做两件事（对齐上游 `cloak.mjs`，2026-11-11 起有效）：
+
+- 给命中句里每个三个字符以上的词，在**第一个和第二个字符后各插一个零宽空格**（U+200B）；
+- 把 Claude/Codex 等常带的「@ 路径」整段改写成同义说法（原句比逐词拆更稳地过风控）。
+
+只插一个零宽空格的旧做法在 11-11 之后失效，这正是之前偶发「假 429 卡住」的原因之一。
+词表与 magpie 的 antigravity-cloak 中间件相同，并自动合并该中间件与 `plugins.json` 的
+`extraWords`；那个中间件只作用于 magpie 自带的 Antigravity 账号，管不到本插件。会话标识、
+续接哈希与用户正文都不改。
+
+如果关掉 cloaking 后仍然撞上「系统提示词被拒」的 429，插件不再把它当额度耗尽：错误类型
+变成 `invalid_request_error` 并附上处置提示，路由组可以换下一个成员，客户端也不会重试。
 
 这会改动发给 Google 的内容，可能违反 Antigravity 条款。不想要就在 Providers 页关掉
 `prompt_cloak`（旧宿主设 `AGY_BRIDGE_PROMPT_CLOAK=0`）。
 
 另外，agy 1.5.x 把重试提示改成了 `⚠ API error (attempt N): …`，插件同样把它过滤掉，
-不会再当成模型回复显示在客户端里。
+不会再当成模型回复显示在客户端里。agy 自己的错误横幅只在**本轮真的结束**时才算失败：
+模型在回复里引用这行（代码块、引用、解释）不会再把整轮回复截断。
+
+## 自动跟随上游
+
+上游 `magpie-community/plugins` 的 `packages/agy-cli` 没有停更。本仓用一个脚本跟进：
+
+```sh
+npm run sync:upstream:check   # 只读：报告上游新提交、新版本、待合并文件
+npm run sync:upstream         # 合并：三方合并进本仓，冲突文件会留下标记并报出来
+```
+
+- 基线记录在 `.upstream-sync.json`（当前 `0.1.39`）；脚本按 `syncedCommit..最新` 取 diff。
+- 合并时自动把上游的 `agy-cli` provider ID、包名改回 `yce-magpie-agy`，所以不会冲掉本仓标识。
+- `accounts.mjs` 多账号切号、`extraWords`、中繁本地化、SQLite `gen_metadata` 计费这些本仓独有
+  文件不会被上游覆盖（`package.json`、README、NOTICE 也在跳过清单里，人工维护）。
+- GitHub Actions（`.github/workflows/upstream-sync.yml`）每天检查一次，有新提交就开/更新
+  `upstream-sync` 标签的 Issue，不会自动改代码。
+
 
 ## 多账号自动切号
 
@@ -292,9 +337,11 @@ node --check mcp-server.mjs
 node --check usage.mjs
 npm test
 npm pack --dry-run
+npm run sync:upstream:check
 ```
 
-`npm test` 用假的 agy 进程跑完整的 ACP 与 MCP 链路，不消耗额度。真实 CLI 的集成检查需要
+`npm test` 用假的 agy 进程跑完整的 ACP 与 MCP 链路，不消耗额度。当前为 223 个单测 +
+362 条 smoke 检查；同步脚本另有 5 个用例（本地临时 git 仓，不联网）。真实 CLI 的集成检查需要
 显式开启，并会消耗少量订阅额度：
 
 ```sh

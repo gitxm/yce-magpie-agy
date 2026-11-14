@@ -8,6 +8,17 @@ is actually carried out by an `agy` process.
 **[中文 → README.md](README.md)** · Provenance, licensing and migration notes:
 [NOTICE.md](NOTICE.md)
 
+> **0.3.0 (2026-11-13)**: synced `magpie-community/plugins` `packages/agy-cli`
+> 0.1.4–0.1.39. Highlights: two-zero-width-space cloaking (the one-ZWSP form stopped
+> working on 2026-11-11 and caused intermittent fake-429 stalls), `$ref`/RE2/Gemini
+> array schema normalization (invalid-output turn aborts), `antigravity/alwaysLoad`
+> (large client tools were hidden from the model), `ide-tools` permission allowed
+> once, quoted error markers no longer truncate a reply, replay budget keeps the
+> tool loop's task message, Gemini 4 Carbon output 262144, Windows GUI-subsystem
+> `nc.exe`, `signin.mjs` (no background agy when signed out), and OpenCode 2.x
+> entrypoints. `npm run sync:upstream:check` reports newer upstream commits; the
+> `upstream-sync` workflow opens an issue daily instead of editing code.
+
 ## What it is
 
 The plugin runs as a Magpie provider. A client sends an Anthropic Messages

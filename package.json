@@ -1,9 +1,12 @@
 {
   "name": "@magpie-community/yce-magpie-agy",
-  "version": "0.2.4",
+  "version": "0.3.0",
   "description": "Magpie/OpenCode model provider that connects your local agy CLI through the Agent Client Protocol (agy acp), so Antigravity subscription models run through the real CLI",
   "type": "module",
-  "main": "./index.mjs",
+  "main": "./opencode.mjs",
+  "exports": {
+    ".": "./opencode2.mjs"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/gitxm/yce-magpie-agy.git"
@@ -11,18 +14,29 @@
   "homepage": "https://github.com/gitxm/yce-magpie-agy#readme",
   "files": [
     "index.mjs",
+    "opencode.mjs",
+    "opencode2.mjs",
     "platform.mjs",
     "mcp-server.mjs",
     "usage.mjs",
     "login.mjs",
     "accounts.mjs",
+    "cloak.mjs",
+    "signin.mjs",
+    "re2-pattern.mjs",
+    "array-items.mjs",
+    "tool-schema.mjs",
+    "scripts/sync-upstream.mjs",
+    ".upstream-sync.json",
     "README.md",
     "README.en.md",
     "LICENSE",
     "NOTICE.md"
   ],
   "scripts": {
-    "test": "node --experimental-vm-modules --test test-usage.mjs test-compat.mjs test-platform.mjs test-catalog.mjs test-usage-settlement.mjs test-usage-floor.mjs test-repeat-batch.mjs test-options.mjs test-accounts.mjs test-qa-switching.mjs test-cache-stats.mjs test-cloak.mjs test-prefill.mjs && node test-smoke.mjs",
+    "test": "node --experimental-vm-modules --test test-usage.mjs test-compat.mjs test-platform.mjs test-catalog.mjs test-usage-settlement.mjs test-usage-floor.mjs test-repeat-batch.mjs test-options.mjs test-accounts.mjs test-qa-switching.mjs test-cache-stats.mjs test-cloak.mjs test-prefill.mjs test-upstream-0139.mjs test-sync-upstream.mjs && node test-smoke.mjs",
+    "sync:upstream": "node scripts/sync-upstream.mjs",
+    "sync:upstream:check": "node scripts/sync-upstream.mjs --check",
     "test:integration": "node test-integration.mjs"
   },
   "keywords": [

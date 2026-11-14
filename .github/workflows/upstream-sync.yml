@@ -1,0 +1,70 @@
+name: upstream-sync
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Check upstream magpie-community/plugins (packages/agy-cli)
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          node scripts/sync-upstream.mjs --check --json > upstream-report.json
+          node - <<'NODE'
+          const fs = require("node:fs")
+          const r = JSON.parse(fs.readFileSync("upstream-report.json", "utf8"))
+          const out = process.env.GITHUB_OUTPUT
+          fs.appendFileSync(out, `up_to_date=${r.upToDate}\n`)
+          fs.appendFileSync(out, `latest_version=${String(r.latestVersion || "")}\n`)
+          fs.appendFileSync(out, `latest_commit=${String(r.latestCommit || "").slice(0, 10)}\n`)
+          fs.appendFileSync(out, `synced_version=${String(r.syncedVersion || "")}\n`)
+          fs.appendFileSync(out, `synced_commit=${String(r.syncedCommit || "").slice(0, 10)}\n`)
+          NODE
+          cat upstream-report.json
+
+      - name: Open or update the tracking issue
+        if: steps.check.outputs.up_to_date == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LATEST_VERSION: ${{ steps.check.outputs.latest_version }}
+          LATEST_COMMIT: ${{ steps.check.outputs.latest_commit }}
+          SYNCED_VERSION: ${{ steps.check.outputs.synced_version }}
+          SYNCED_COMMIT: ${{ steps.check.outputs.synced_commit }}
+        run: |
+          set -euo pipefail
+          TITLE="upstream: agy-cli ${LATEST_VERSION} (${LATEST_COMMIT})"
+          {
+            echo "Upstream \`magpie-community/plugins\` \`packages/agy-cli\` moved from \`${SYNCED_VERSION}\` (\`${SYNCED_COMMIT}\`) to \`${LATEST_VERSION}\` (\`${LATEST_COMMIT}\`)."
+            echo
+            echo "Review the report and port what applies to \`yce-magpie-agy\` (keep the provider ID, accounts.mjs, localization and the local usage/calibration path):"
+            echo
+            echo '```json'
+            cat upstream-report.json
+            echo '```'
+            echo
+            echo "After merging, run \`node scripts/sync-upstream.mjs --apply\` locally (or bump \`.upstream-sync.json\`), then \`npm test\`."
+          } > issue-body.md
+          EXISTING=$(gh issue list --label upstream-sync --state open --limit 50 --json number,title \
+            --jq '.[] | select(.title | startswith("upstream: agy-cli")) | .number' | head -n 1)
+          if [ -n "${EXISTING}" ]; then
+            gh issue comment "${EXISTING}" --body-file issue-body.md
+          else
+            gh label create upstream-sync --color BFD4F2 --description "Upstream magpie-community/plugins changes" 2>/dev/null || true
+            gh issue create --title "${TITLE}" --label upstream-sync --body-file issue-body.md
+          fi

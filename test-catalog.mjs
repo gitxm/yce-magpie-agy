@@ -221,7 +221,7 @@ test("各家族 limit 正确，未知动态型号不猜成 1M", async () => {
   await withKit({ agyPath: null }, async (kit) => {
     const staticModels = await kit.models()
     assert.deepEqual(JSON.parse(JSON.stringify(staticModels["gemini-4-carbon"]?.limit ?? null)),
-      { context: 1048576, output: 65536 }, "静态目录 gemini-4-carbon 的 limit 不对")
+      { context: 1048576, output: 262144 }, "静态目录 gemini-4-carbon 的 limit 不对")
   })
   for (const [label, options] of [["静态目录", { agyPath: null }], ["动态目录", { modelsBehavior: DYNAMIC_OK }]]) {
     await withKit(options, async (kit) => {

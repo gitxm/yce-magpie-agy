@@ -3,20 +3,29 @@ import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { agySpawnSpec } from "./platform.mjs"
+import { cannotSignIn, isDead, noteDead, readStoredSignIn, storedSignIn } from "./signin.mjs"
 
 const DEFAULT_TIMEOUT_MS = 15_000
 const MAX_TIMEOUT_MS = 18_000 // Magpie bounds an auth.usage call to 20 seconds.
 const MAX_OUTPUT_BYTES = 1024 * 1024
 const CLEANUP_ATTEMPTS = 8
 
-class UsageError extends Error {}
+class UsageError extends Error {
+  constructor(message, { kind = "", output = "" } = {}) {
+    super(message)
+    this.kind = kind
+    this.output = output
+  }
+}
+
+const SIGN_IN_TALK = /accounts\.google\.com|oauth|sign[ -]?in|log[ -]?in|authenticat|browser/i
 
 const text = value => typeof value === "string" ? value.trim() : ""
 const field = (value, camel, snake) => value?.[camel] ?? value?.[snake]
 
 function commandFailure(output) {
   if (/not (?:logged|signed) in|unauthenticated|authentication required|login required|please (?:log|sign) in|sign in again/i.test(output)) {
-    return new UsageError("agy usage needs authentication. Run `agy` in a terminal to sign in again.")
+    return new UsageError("agy usage needs authentication. Run `agy` in a terminal to sign in again.", { kind: "auth" })
   }
   const eligibility = /eligibility check failed|not eligible|unsupported (?:country|region)|does not support google tos/i.test(output)
   const network = /\b(?:eof|timeout|timed out|deadline exceeded|no such host|connection (?:refused|reset)|network|proxy|tls|ssl|certificate)\b/i.test(output)
@@ -216,9 +225,9 @@ function run(file, args, { cwd, env, deadline, signal, maxOutputBytes, onTreeKil
       if (error) reject(error)
       else resolve(result)
     }
-    const abort = () => finish(new UsageError("agy usage query was cancelled."))
+    const abort = () => finish(new UsageError("agy usage query was cancelled.", { kind: "cancel" }))
     if (signal?.aborted) return abort()
-    if (Date.now() >= deadline) return finish(new UsageError("agy usage query timed out."))
+    if (Date.now() >= deadline) return finish(new UsageError("agy usage query timed out.", { kind: "timeout" }))
     try {
       const command = agySpawnSpec(file, args)
       child = spawn(command.file, command.args, {
@@ -239,7 +248,10 @@ function run(file, args, { cwd, env, deadline, signal, maxOutputBytes, onTreeKil
       return
     }
     signal?.addEventListener("abort", abort, { once: true })
-    timer = setTimeout(() => finish(new UsageError("agy usage query timed out.")), Math.max(1, deadline - Date.now()))
+    timer = setTimeout(() => finish(new UsageError("agy usage query timed out.", {
+      kind: "timeout",
+      output: Buffer.concat(stderr).toString("utf8") + "\n" + Buffer.concat(stdout).toString("utf8"),
+    })), Math.max(1, deadline - Date.now()))
     const collect = chunks => chunk => {
       if (settled) return
       bytes += chunk.length
@@ -304,7 +316,11 @@ export async function fetchUsage(agy, {
       BROWSER: path.join(directory, process.platform === "win32" ? "open.cmd" : "open"),
     }
     const options = { cwd: directory, env: childEnv, deadline, signal, maxOutputBytes, onTreeKill: p => { pendingTreeKill = p } }
-    const version = await run(agy, ["--version"], { ...options, deadline: Math.min(deadline, Date.now() + timeout(versionTimeoutMs)) })
+    // --version needs no sign-in, so its hang is never read as one
+    const version = await run(agy, ["--version"], { ...options, deadline: Math.min(deadline, Date.now() + timeout(versionTimeoutMs)) }).catch((error) => {
+      if (error?.kind === "timeout") throw new UsageError(error.message)
+      throw error
+    })
     if (version.code !== 0) throw commandFailure(version.stderr)
     if (!supportedVersion(version.stdout)) throw new UsageError("agy usage reports require a verified agy version 1.1.11 or later. Update the CLI.")
     const result = await run(agy, ["-p", "/usage", "--output-format", "json", "--agent", "magpie-usage", "--print-timeout", `${Math.max(1, Math.ceil((deadline - Date.now()) / 1000))}s`], options)
@@ -326,44 +342,96 @@ export async function fetchUsage(agy, {
   }
 }
 
+const BACKOFF_FIRST_MS = 10 * 60 * 1000
+const BACKOFF_MOST_MS = 6 * 60 * 60 * 1000
+
+function backoff(n) {
+  return Math.min(BACKOFF_FIRST_MS * 2 ** Math.max(0, Math.min(n, 20) - 1), BACKOFF_MOST_MS)
+}
+
+const NEEDS_SIGN_IN = "Sign in again from this account's Sign in in magpie, or run `agy` in a terminal; magpie doesn't run agy for usage until then."
+
 // No completed-result cache: sequential refreshes must see account/allowance changes.
 export function createUsageReader(resolveAgy, options = {}) {
+  const customSignIn = typeof options.signIn === "function"
+  const {
+    signIn = () => (options.env?.TEST_LOG ? Promise.resolve({ state: "unknown" }) : storedSignIn({
+      read: () => readStoredSignIn({ env: options.env ?? process.env }),
+    })),
+    now = () => Date.now(),
+    waitForGate = async () => {},
+    isGateClosed = () => false,
+    getGeneration = () => 0,
+    ...fetchOptions
+  } = options
   const pending = new Map()
-  const { waitForGate = async () => {}, isGateClosed = () => false, getGeneration = () => 0, ...fetchOptions } = options
   let revision = 0
+  let held = null
+  let saidExpired = false
+  const expired = (why) => {
+    saidExpired = true
+    return { windows: [], error: `${why}. ${NEEDS_SIGN_IN}`, signIn: "expired" }
+  }
   const read = async () => {
-    try {
-      for (;;) {
-        await waitForGate()
-        if (isGateClosed()) continue
-        const generation = getGeneration()
-        const started = revision
-        const agy = resolveAgy()
-        const key = JSON.stringify([agy, generation, started])
-        if (!pending.has(key)) {
-          const controller = new AbortController()
-          const signal = fetchOptions.signal
-            ? AbortSignal.any([controller.signal, fetchOptions.signal]) : controller.signal
-          const query = fetchUsage(agy, { ...fetchOptions, signal }).finally(() => {
-            if (pending.get(key)?.query === query) pending.delete(key)
-          })
-          pending.set(key, { query, controller })
-        }
-        try {
-          const result = await pending.get(key).query
-          if (revision !== started || getGeneration() !== generation) continue
-          return { ...structuredClone(result), signIn: "kept" }
-        } catch (error) {
-          if (revision !== started || getGeneration() !== generation) continue
-          throw error
-        }
+    for (;;) {
+      await waitForGate()
+      if (isGateClosed()) continue
+      const generation = getGeneration()
+      const started = revision
+      let stored
+      try { stored = await signIn() } catch { stored = { state: "unknown" } }
+      if (revision !== started || getGeneration() !== generation) continue
+      const why = cannotSignIn(stored)
+      if (why) return expired(why)
+      if (isDead(stored)) return expired("agy's sign-in no longer works")
+      const trackSignIn = customSignIn || stored?.state === "present"
+      const holdKey = stored?.state === "present" ? stored.fp : "unknown"
+      if (trackSignIn && held && held.key === holdKey && now() < held.until) {
+        return { windows: [], error: held.error, signIn: held.auth ? "expired" : "kept" }
       }
-    } catch (error) {
-      return { windows: [], error: error instanceof UsageError || error?.statusCode === 503 ? error.message : "agy usage query failed. Check the CLI and temporary-directory permissions.", signIn: "kept" }
+      const agy = resolveAgy()
+      const key = JSON.stringify([agy, generation, started])
+      if (!pending.has(key)) {
+        const controller = new AbortController()
+        const signal = fetchOptions.signal
+          ? AbortSignal.any([controller.signal, fetchOptions.signal]) : controller.signal
+        const query = fetchUsage(agy, { ...fetchOptions, signal }).finally(() => {
+          if (pending.get(key)?.query === query) pending.delete(key)
+        })
+        pending.set(key, { query, controller })
+      }
+      try {
+        const result = await pending.get(key).query
+        if (revision !== started || getGeneration() !== generation) continue
+        const status = saidExpired ? "renewed" : "kept"
+        held = null
+        saidExpired = false
+        return { ...structuredClone(result), signIn: status }
+      } catch (error) {
+        if (revision !== started || getGeneration() !== generation) continue
+        const message = error instanceof UsageError || error?.statusCode === 503
+          ? error.message
+          : "agy usage query failed. Check the CLI and temporary-directory permissions."
+        if (error?.kind === "cancel" || !trackSignIn) {
+          return { windows: [], error: message, signIn: "kept" }
+        }
+        const auth = error?.kind === "auth" || error?.kind === "timeout" && stored?.state === "present" && stored.expired &&
+          (!String(error.output ?? "").trim() || SIGN_IN_TALK.test(error.output))
+        if (auth && stored?.state === "present") {
+          noteDead(stored)
+          return expired("agy's sign-in no longer works")
+        }
+        const n = held?.key === holdKey ? held.n + 1 : 1
+        held = { key: holdKey, n, until: now() + backoff(n), error: message, auth }
+        if (auth) saidExpired = true
+        return { windows: [], error: message, signIn: auth ? "expired" : "kept" }
+      }
     }
   }
   read.invalidate = async () => {
     revision++
+    held = null
+    saidExpired = false
     const old = [...pending.values()]
     for (const entry of old) entry.controller.abort()
     await Promise.allSettled(old.map(entry => entry.query))

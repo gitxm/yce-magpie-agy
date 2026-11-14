@@ -65,6 +65,24 @@ export function agySpawnSpec(file, args, platform = process.platform, env = proc
   }
 }
 
+export function childEnv(parent = process.env, extra = {}, platform = process.platform) {
+  const env = {}
+  const names = new Map()
+  for (const source of [parent, extra]) {
+    for (const [key, value] of Object.entries(source || {})) {
+      if (value === undefined) continue
+      const name = platform === "win32" ? key.toUpperCase() : key
+      if (names.has(name)) delete env[names.get(name)]
+      names.set(name, key)
+      env[key] = value
+    }
+  }
+  if (![...names.keys()].some(name => name.toUpperCase() === "AGY_CLI_DISABLE_AUTO_UPDATE")) {
+    env.AGY_CLI_DISABLE_AUTO_UPDATE = "true"
+  }
+  return env
+}
+
 export function spawnAgy(file, args, options = {}) {
   const command = agySpawnSpec(file, args)
   const env = {}
@@ -89,4 +107,15 @@ export function windowsMcpShim(executable, server) {
     return `"${value.replace(/%/g, "%%")}"`
   }
   return `@echo off\r\nsetlocal DisableDelayedExpansion\r\n${quote(executable)} ${quote(server)}\r\n`
+}
+
+export function windowsNcBuild(runtime, server, outfile, versions = process.versions) {
+  if (!versions?.bun || !/^(?:magpie-)?bun(?:\.exe)?$/i.test(path.win32.basename(String(runtime || "")))) return null
+  return { file: runtime, args: ["build", "--compile", "--windows-hide-console", server, "--outfile", outfile] }
+}
+
+export function windowsTreeKill(pids) {
+  const live = [...new Set(pids)].filter(pid => Number.isInteger(pid) && pid > 0)
+  if (!live.length) return null
+  return { file: "taskkill", args: ["/T", "/F", ...live.flatMap(pid => ["/PID", String(pid)])] }
 }

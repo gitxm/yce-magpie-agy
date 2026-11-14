@@ -1,6 +1,6 @@
 # NOTICE：来源与合规说明
 
-本仓（`@magpie-community/yce-magpie-agy`，版本 0.1.0）是 Antigravity 桥接插件
+本仓（`@magpie-community/yce-magpie-agy`，版本 0.3.0）是 Antigravity 桥接插件
 `@magpie-community/opencode-antigravity-bridge` 的独立维护分支，以 MIT 协议发布。
 **本仓为独立维护分支，与上游无隶属关系。** 上游版权声明原样保留在 [LICENSE](LICENSE)，
 本仓新增部分的版权归 gitxm 与 yce。
@@ -10,7 +10,7 @@
 | 项目 | 取值 |
 |---|---|
 | npm 包名 | `@magpie-community/yce-magpie-agy` |
-| 版本 | `0.1.0` |
+| 版本 | `0.3.0` |
 | 仓库 | `https://github.com/gitxm/yce-magpie-agy` |
 | Magpie provider ID | `yce-magpie-agy` |
 | 安装（GitHub） | `magpie plugin add github:gitxm/yce-magpie-agy` |
@@ -27,6 +27,8 @@
 | PR #8 基线（代码底稿） | `gitxm/opencode-antigravity-bridge@acb8d84c5136d18889d7d4b91f119117b57abb74` | 分支 `fix/windows-bg-updater-popup`，父提交为上游 `7e13b12`；包含 `platform.mjs`、Windows 无弹窗修复与多步用量结算 |
 | 本机补丁（`index.mjs`） | `index.mjs.patched`，md5 `38aa8d42f3e76a2536d11be63b5807a5` | 基于上游 `212179f` 的本机补丁版 |
 | 本机补丁（`usage.mjs`） | `usage.mjs.patched`，md5 `df212a2c934ffd4a38d7f3ef95271c5d` | 基于上游 `7e13b12` 的本机补丁版 |
+| 社区 fork 基线 | `magpie-community/plugins@a5a63a109f0a3345cc3a075712a54acc71603e2d`（`packages/agy-cli` 0.1.3） | 2026-11-10 对齐的官方 `agy-cli` 版本（预填、登录、ACP 版本检查） |
+| 社区 fork 同步 | `magpie-community/plugins@4f5d4138ad51b1d40a5b591bbb022941734412bf`（`packages/agy-cli` 0.1.39，`packages/antigravity-cloak` 0.1.5） | 2026-11-13 同步：cloak 双零宽空格、RE2/JSON Schema 归一化、`alwaysLoad`、`ide-tools` 权限放行、`#1052` 错误横幅、`#1053/#1055/#1093` 重放预算、Carbon 262144 输出、Windows `nc.exe`、`signin.mjs`、OpenCode 2.x 入口 |
 
 合并原则：代码以 PR #8（`acb8d84`）为底。本机补丁中 `acb8d84` 没有的修复，按下面的
 A1–A16、U1–U6 逐项并入。两边都有、且 `acb8d84` 写法更新的部分（多步用量结算、
@@ -65,9 +67,26 @@ A1–A16、U1–U6 逐项并入。两边都有、且 `acb8d84` 写法更新的�
 | U5 | PATH 大小写去重：删除非大写的 `Path` 键，继承 `env.PATH`，没有时回落到 `env.Path` |
 | U6 | 临时目录删除遇到 `EBUSY`、`EPERM`、`ENOTEMPTY` 时，先等待在途的 `taskkill` 释放目录句柄，再最多重试 4 次，每次间隔递增 50 ms |
 
+## 4a. 0.3.0 并入的社区上游能力（`agy-cli` 0.1.4–0.1.39）
+
+| 模块 | 内容 |
+|---|---|
+| `cloak.mjs` | 新增。两零宽空格拆词、oh-my-pi RFC 2119 行、DeepSeek Harness `@路径`段落改写、被拒提示语。本仓在其上叠加 `extraWords` / 中间件词表 / `AGY_BRIDGE_EXTRA_CLOAK_WORDS` |
+| `re2-pattern.mjs` / `array-items.mjs` / `tool-schema.mjs` | 新增。工具 schema 的 RE2 正则翻译或降级、Gemini 数组 `items` 补全、`$ref`/`allOf`/`oneOf` 展开 |
+| `signin.mjs` | 新增。读系统凭据库判断 agy 登录态，未登录时后台不启动 agy |
+| `index.mjs` | `#1052` 错误横幅改为本轮结束后判定；`#1053/#1055/#1093` 重放预算优先保留工具循环的任务消息；`#1082` ide-tools 权限放行一次；`#989` `alwaysLoad`；`#942` 工具增长后新会话重放；`#947` 会话键稳定；`#1064` 目录预热；`#1086` 目录持久化；`#1058` 新会话原因日志；`#1017`/`#1055` 系统通知与标签路由；Windows `nc.exe`、进程树回收 |
+| `platform.mjs` | 新增 `childEnv`、`windowsNcBuild`、`windowsTreeKill` |
+| `usage.mjs` | 登录态感知的额度读取与失败退避；保留本仓的账号掩码与冷却逻辑 |
+| `opencode.mjs` / `opencode2.mjs` | 新增 OpenCode 1.x / 2.x 入口 |
+| `scripts/sync-upstream.mjs` + `.github/workflows/upstream-sync.yml` | 本仓新增。三方合并跟进上游，provider ID 归一化，定时开 Issue |
+
+本仓保留、不被上游覆盖：`accounts.mjs` 多账号切号、`AGY_BRIDGE_MAX_INPUT_TOKENS` 上下文门禁、
+SQLite `gen_metadata` 逐步计费与按模型族校准、中繁本地化、`extraWords` 合并、
+`prompt is too long` 400 兼容 Claude Code 自动压缩。
+
 ## 5. 包与文档层改动
 
-- 包名改为 `@magpie-community/yce-magpie-agy`，版本 `0.1.0`，`repository` 与 `homepage` 指向 `gitxm/yce-magpie-agy`。
+- 包名改为 `@magpie-community/yce-magpie-agy`，版本 `0.3.0`，`repository` 与 `homepage` 指向 `gitxm/yce-magpie-agy`。
 - `magpie.maxConcurrency` 与 `AGY_BRIDGE_MAX_PROCS` 默认值统一为 16。
 - `README.md`、`README.en.md` 整篇重写，`HANDOFF.md` 更新标识与历史记录，`LICENSE` 追加本仓版权行。
 - `NOTICE.md`（本文件）与 `LICENSE` 一并随包发布。

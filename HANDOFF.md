@@ -1,3 +1,36 @@
+## 2026-11-13：同步社区上游 agy-cli 0.1.4–0.1.39（v0.3.0）与自动跟进
+
+- **起因**：本机 Magpie 日志（`AppData/Local/magpie/logs/app.log`）与
+  `usage.jsonl` 显示两类「发一半停住」：①流出一段时间后报
+  `agy stopped the turn because of an error: Model produced invalid output.`（工具 schema 里的
+  非 RE2 正则、缺 `items` 的数组、未展开的 `$ref/allOf/oneOf`，以及 agy 1.5.5 把大 schema
+  工具藏进懒加载）；②`status 499` 卡满 300 秒（2026-11-11 起单零宽空格绕过失效，假 429 被
+  agy 无限退避重试，重试横幅又被插件吞掉）。上游 `agy-cli` 0.1.4–0.1.39 已逐条修掉。
+- **同步方式**：以 `packages/agy-cli@0.1.3`（`a5a63a1`）为 base、`0.1.39`（`4f5d413`）为
+  theirs，对 `index.mjs` 做三方合并，27 处冲突逐个按「保留本仓扩展 + 采纳上游修复」裁定。
+- **新增模块**：`cloak.mjs`（两零宽空格拆词 + RFC 2119 + DSH `@路径`改写；本仓再叠加
+  `extraWords`/中间件词表/环境变量）、`re2-pattern.mjs`、`array-items.mjs`、
+  `tool-schema.mjs`、`signin.mjs`（凭据库登录态，未登录不后台起 agy）、`opencode.mjs`、
+  `opencode2.mjs`。`platform.mjs` 增加 `childEnv`/`windowsNcBuild`/`windowsTreeKill`，
+  `usage.mjs` 增加登录态感知与失败退避，同时保留账号掩码/冷却。
+- **index.mjs 关键修复**：`#1052` 错误横幅只在 prompt 真正结束（`endText`）时判失败，
+  模型引用该行不再截断整轮；`#1082` `ide-tools` 权限放行一次；`#989` 工具加
+  `antigravity/alwaysLoad`；`#942` 工具增长后新会话重放；`#1053/#1055/#1093` 重放预算优先
+  保留工具循环的任务消息；`#947` 会话键跨易变开头稳定；`#1064`/`#1086` 目录预热与持久化；
+  `#1058` 新会话原因日志；`#1017` 会话 ID 来自宿主头；Windows `nc.exe` 与进程树回收。
+- **保留本仓实现**：多账号切号（`accounts.mjs`）、`AGY_BRIDGE_MAX_INPUT_TOKENS` 上下文门禁
+  与 `prompt is too long` 400、SQLite `gen_metadata` 逐步计费与按模型族校准、
+  中繁本地化、`extraWords`。上游的 `step-usage.mjs` 计费路径**未**并入（与本仓 SQLite 路径
+  二选一），避免两套计费互相覆盖。
+- **自动跟进**：`scripts/sync-upstream.mjs`（`--check` / `--apply`，把上游 `agy-cli` ID、
+  包名归一化回 `yce-magpie-agy`，跳过 `package.json`/README/NOTICE/`accounts.mjs`）；
+  `.upstream-sync.json` 记录基线；`.github/workflows/upstream-sync.yml` 每天检查并开/更新
+  `upstream-sync` Issue，不自动改代码。
+- **验证**：`npm test` 223 个单测 + 362 条 smoke 全绿（Node 与 Bun 1.4.2 的 smoke 都跑过）；
+  新增 `test-upstream-0139.mjs` 6 项、`test-sync-upstream.mjs` 5 项；防假绿：去掉
+  `alwaysLoad` 后 `test-upstream-0139` 第 3 项变红，恢复即绿。未做真实 agy 端到端（本机
+  agy 当时额度 429）。
+
 ## 2026-11-10：Claude Code 子代理调不起工具（假 429）与 agy 1.5.x 重试横幅（v0.2.3–v0.2.4）
 
 - **根因（实测）**：Antigravity 对系统提示词里的 `You are a Claude agent, built on

@@ -462,6 +462,7 @@ export async function createBridgeKit(options = {}) {
     USERPROFILE: home,
     LOCALAPPDATA: path.join(tmp, "localappdata"),
     XDG_STATE_HOME: path.join(tmp, "state"),
+    AGY_BRIDGE_STORED_SIGNIN: "skip",
     AGY_PATH: options.agyPath === undefined ? kit.agyPath : options.agyPath,
     ...(options.env || {}),
   }
@@ -524,19 +525,16 @@ export async function createBridgeKit(options = {}) {
   }, { identifier: RUNTIME_SPECIFIER })
   const cache = new Map([[RUNTIME_SPECIFIER, runtime]])
   const indexUrl = pathToFileURL(path.join(REPO_DIR, "index.mjs")).href
-  const usageUrl = pathToFileURL(USAGE_FILE).href
-  const platformUrl = pathToFileURL(PLATFORM_FILE).href
   const linker = (specifier) => {
     const key = specifier.startsWith("node:") || specifier.startsWith("./") || specifier === RUNTIME_SPECIFIER
       ? specifier
       : `node:${specifier}`
     if (cache.has(key)) return cache.get(key)
     let module
-    if (key === "./usage.mjs") module = sourceModule(USAGE_FILE, "", usageUrl)
-    else if (key === "./platform.mjs") module = sourceModule(PLATFORM_FILE, "", platformUrl)
-    else if (key === "./login.mjs") module = sourceModule(LOGIN_FILE, "", pathToFileURL(LOGIN_FILE).href)
-    else if (key === "./accounts.mjs") module = sourceModule(ACCOUNTS_FILE, "", pathToFileURL(ACCOUNTS_FILE).href)
-    else if (key.startsWith("node:")) module = builtinModule(key, overrides[key])
+    if (key.startsWith("./") && key.endsWith(".mjs")) {
+      const file = path.join(REPO_DIR, key.slice(2))
+      module = sourceModule(file, "", pathToFileURL(file).href)
+    } else if (key.startsWith("node:")) module = builtinModule(key, overrides[key])
     else throw new Error(`testkit: 未登记的依赖 ${specifier}`)
     cache.set(key, module)
     return module
